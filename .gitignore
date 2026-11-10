@@ -1,0 +1,46 @@
+.claude
+.venv
+# ignore uv files
+.env
+.python-version
+pyproject.toml
+uv.lock
+
+# 任何子目录下的 .env（防止运行时写回时路径偏移产生的副本）
+**/.env
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+venv/
+.env/
+
+# VSCode
+.vscode/
+
+# Mac
+.DS_Store
+
+# Debug files
+debug_*.py
+verify_*.py
+*_debug.py
+
+# Log files
+*.log
+
+# mem0 SQLite历史库（含记忆原文）与运行时数据
+data/
+app/data/
+*.db
+
+# Temporary reports
+*_REPORT.txt
+*_SUMMARY.txt
+hippocampus_verification_report_*.txt
+
+# IDE
+.idea/
