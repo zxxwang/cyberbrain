@@ -1,5 +1,7 @@
 # CyberBrain 依赖的数据库
 
+[English](QUICKSTART.en.md) | **中文**
+
 CyberBrain 运行时依赖三个外部数据库服务和一组本地 SQLite 文件。连接地址都在 `.env` 中配置（配置项名与 `app/config/settings.py` 一一对应，可参考 `.env.example`）。
 
 | 数据库 | 是否必需 | 用途 | 配置项 | 默认地址 |

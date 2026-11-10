@@ -6,6 +6,8 @@
 
 让 Agent 像一个有记忆、有情绪、有自己生活的人一样说话
 
+[English](README.en.md) | **中文**
+
 [设计理念](#设计理念) · [效果展示](#效果展示) · [功能](#功能) · [架构文档](docs/ARCHITECTURE.md) · [依赖](QUICKSTART.md)
 
 <img src="images/init.png" alt="CyberBrain 初始化页面" width="100%">

@@ -1,5 +1,7 @@
 # CyberBrain 架构与实现
 
+[English](ARCHITECTURE.en.md) | **中文**
+
 本文描述 CyberBrain 的核心流程和实现细节，内容以当前代码为准。设计思路见 [README.md](../README.md)，依赖的数据库见 [QUICKSTART.md](../QUICKSTART.md)。
 
 ## 目录
