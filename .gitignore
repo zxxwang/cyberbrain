@@ -44,3 +44,6 @@ hippocampus_verification_report_*.txt
 
 # IDE
 .idea/
+
+# 测试脚本（不进仓库）
+tests/
