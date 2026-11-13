@@ -8,7 +8,7 @@ Agents that talk like real people, with memories, moods and lives of their own
 
 **English** | [中文](README.md)
 
-[Design Philosophy](#design-philosophy) · [Showcase](#showcase) · [Features](#features) · [Architecture](docs/ARCHITECTURE.en.md) · [Dependencies](QUICKSTART.en.md)
+[Design Philosophy](#design-philosophy) · [Showcase](#showcase) · [Use Cases](#use-cases) · [Features](#features) · [Architecture](docs/ARCHITECTURE.en.md) · [Dependencies](QUICKSTART.en.md)
 
 <img src="images/init.png" alt="CyberBrain initialization page" width="100%">
 
@@ -99,6 +99,46 @@ The full thinking process of every turn is recorded: instinct scores, which cogn
 <img src="images/config.png" alt="Editing an agent" width="100%">
 
 > The web UI is currently in Chinese.
+
+---
+
+## Use Cases
+
+CyberBrain is not a ready-made product but a configurable cognitive foundation. An agent's personality, history, situation, knowledge and relationships are all written through configuration and APIs; the more completely it is configured, the more clearly it behaves as a distinct someone. These are the main targets the design was built for:
+
+### 🤝 AI companionship
+
+Configure an agent as one specific person who exists over time: a full System1 / System2 persona, a way of speaking, a description of how it relates to *you*, and an initial history with causes and consequences.
+
+- It remembers what you mentioned, and lets unimportant details fade day by day; when you bring something up again, the related memories become vivid again
+- Mood, stress and energy drift slowly with your conversations and shape how much it wants to talk and how carefully it chooses its words
+- It has thoughts and worries of its own even when nobody is speaking; things it promised you become to-dos it carries out on its own at a suitable time
+- It stays guarded with strangers and relaxes with people it knows, and that difference comes from the relationship table rather than a line in the prompt telling it to be friendly
+
+Compared with re-reading a character sheet on every turn, the continuity here comes from state: situation, feelings and memory together decide how it answers you right now.
+
+### 📚 Personal knowledge base and specialist assistant
+
+Keep knowledge separate from the person: professional knowledge lives in Knowledge memory, organized by domain, sub-domain, proficiency and source, and can be written in bulk through the API.
+
+- Each turn pre-fetches knowledge and judges whether the conversation actually needs expertise; when it does, only the two or three most relevant entries are injected, with a length limit
+- Knowledge affects *what* is said, not *how* it is said, so the same knowledge base with different personas produces different ways of expressing it
+- Brief memory holds stable facts about you and the project, Episodic holds what has been done, and together the three make an assistant that understands the domain, remembers the context, and still has its own judgment
+
+It suits turning personal notes, documents and distilled experience into a second brain you can actually talk to, rather than a search box with an answer.
+
+### 🎭 Multi-agent simulation
+
+Every agent ties its whole state to one `agent_id`: persona, memory, situation, to-dos and relationships each live in their own keys and collections, with no interference. That means several agents can run in one service and interact with each other.
+
+- The conversation endpoint takes a `speaker`, so who is talking is explicit; the relationship description decides how the other side is seen
+- A to-do that requires contacting someone makes the initiator call the other agent's conversation endpoint, producing a real two-way exchange
+- Each exchange and each private thought goes into that agent's own memory, so over time relationships, misunderstandings and shared history accumulate
+- Backed by the `/admin/initialize_agent` endpoint, which installs persona, initial memories, knowledge and relationships for each character, you can stand up a cast of characters with their own personalities and lives, and watch how they affect each other without anyone intervening
+
+### Beyond these
+
+The same machinery suits role-play style narrative, virtual characters that need long-term consistency, and experiments on how memory and emotion shape language. If you can describe the persona, the memories and the situation, the system can carry the performance from there.
 
 ---
 
