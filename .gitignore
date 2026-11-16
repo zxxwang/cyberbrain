@@ -1,4 +1,5 @@
 .claude
+.omx
 .venv
 # ignore uv files
 .env
@@ -44,6 +45,7 @@ hippocampus_verification_report_*.txt
 
 # IDE
 .idea/
+logs/
 
 # 测试脚本（不进仓库）
 tests/
