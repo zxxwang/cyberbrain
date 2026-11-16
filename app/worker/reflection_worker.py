@@ -4,7 +4,7 @@ Reflection Worker: 把经历沉淀成信念（模拟睡眠中的记忆重放与�
 白天发生的事先作为"经历"存在 Episodic。只有经过反复出现、情绪确认、或与已有认识反复印证的，
 才沉淀成"信念"（Brief）。对话不直接写 Brief（见 memory_gate_service），Brief 只由这里写入。
 
-每天凌晨跑一次（默认 04:00）：
+每天每日整理之后跑一次（由 prefrontal_lobe_memory_worker 调用 run_once）：
 1. 取每个 agent 的 Episodic 中"被碰过"（updated_at != created_at）且 24 小时内更新过的记忆
 2. 连同该 agent 现有的人格片段和全部 Brief 一起交给 LLM，判断哪些够格沉淀成信念
 3. 有界步长：每个 agent 每轮最多 2 条；confidence 低于阈值一律不写
@@ -160,55 +160,24 @@ class ReflectionWorkerService:
     def __init__(self):
         self.running = False
 
-    async def start(self):
-        self.running = True
-        logger.info(f"ReflectionWorker started: run_hour={settings.REFLECTION_WORKER_RUN_HOUR}, "
-                    f"max_candidates={settings.REFLECTION_MAX_CANDIDATES}, max_actions={settings.REFLECTION_MAX_ACTIONS}")
-        while self.running:
-            wait = await self._seconds_until_due()
-            if wait > 0:
-                logger.info(f"ReflectionWorker: next run in {wait / 3600:.1f}h")
-                await asyncio.sleep(min(wait, 3600))  # 最多睡 1 小时，期间配置改了也能跟上
-                continue
-            # 先记执行时间再跑：跑完再记的话，_seconds_until_due 在运行期间仍是 0，
-            # 循环会连续触发（实测一晚写了 6 条重复信念）
-            await redis_client.set(LAST_RUN_KEY, str(time.time()))
-            try:
-                await self._reflect_all()
-            except Exception as e:
-                logger.error(f"Error in reflection worker loop: {e}", exc_info=True)
-
-    def stop(self):
-        self.running = False
-        logger.info("ReflectionWorker stopped")
-
-    @staticmethod
-    def _next_run_at() -> datetime:
-        now = datetime.now()
-        target = now.replace(hour=settings.REFLECTION_WORKER_RUN_HOUR, minute=0, second=0, microsecond=0)
-        return target if target > now else target + timedelta(days=1)
-
-    async def _seconds_until_due(self) -> float:
+    async def run_once(self) -> None:
         """
-        每天只在指定小时跑一次。三个条件同时满足才算到期：
-        1. 现在已过今天的目标时间；2. 今天还没跑过（LAST_RUN_KEY 早于今天的目标时间）；
-        3. 距上次执行已满 20 小时（防止改配置或系统时间跳变导致重复跑）
-        服务重启不会额外跑一次。
+        跑一轮反思。由每日整理（prefrontal_lobe_memory_worker）在整理完经历后调用：
+        反思要看到今天刚整理出、刚被重激活的经历，必须排在整理之后，所以不再单独定时。
+        LAST_RUN_KEY 先记再跑，防止同一天被重复触发
         """
-        now = datetime.now()
-        target = now.replace(hour=settings.REFLECTION_WORKER_RUN_HOUR, minute=0, second=0, microsecond=0)
-        if now < target:
-            return (target - now).total_seconds()
         try:
             last_run = await redis_client.get(LAST_RUN_KEY)
+            if last_run and time.time() - float(last_run) < 20 * 3600:
+                logger.info("Reflection skipped: already ran within 20 hours")
+                return
         except Exception as e:
             logger.warning(f"Failed to read {LAST_RUN_KEY}: {e}")
-            return (target + timedelta(days=1) - now).total_seconds()
-        if last_run:
-            last = datetime.fromtimestamp(float(last_run))
-            if last >= target or (now - last).total_seconds() < 20 * 3600:
-                return (target + timedelta(days=1) - now).total_seconds()
-        return 0.0
+        await redis_client.set(LAST_RUN_KEY, str(time.time()))
+        try:
+            await self._reflect_all()
+        except Exception as e:
+            logger.error(f"Error in reflection run: {e}", exc_info=True)
 
     # ---------------- 主流程 ----------------
 
@@ -262,7 +231,8 @@ class ReflectionWorkerService:
                 continue
             if mem.get("type") == "task_completion":
                 continue  # 系统执行回执，不是经历
-            is_fact = mem.get("gate_type") == "SEMANTIC"
+            # 事实型：旧版 Memory Gate 写入的 SEMANTIC，或整理时提取的经历（本身就是筛过的"值得记住的事"）
+            is_fact = mem.get("gate_type") == "SEMANTIC" or mem.get("source") == "consolidation"
             is_important = int(mem.get("importance") or 0) >= 3
             if is_fact or (settings.REFLECTION_INCLUDE_HIGH_IMPORTANCE and is_important):
                 out.append(mem)

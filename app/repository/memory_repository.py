@@ -12,7 +12,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.client.embedding_client import embedding_client
 from app.client.rerank_client import rerank_client
@@ -723,6 +723,88 @@ class MemoryRepository:
 
         except Exception as e:
             logger.error(f"Failed to update decay_weight for {memory_id}: {e}")
+            return False
+
+    async def find_similar(
+        self, agent_id: str, text: str, min_score: float, limit: int = 3, memory_type: str = "episodic"
+    ) -> List[Tuple[str, float, str]]:
+        """该 agent 的记忆里与 text 向量余弦 ≥ min_score 的若干条：[(id, 余弦, 正文)]，按相似度降序"""
+        if not self.enabled:
+            return []
+        client = self.brief_client if memory_type == "brief" else self.episodic_client
+        if not client:
+            return []
+
+        def _search():
+            from qdrant_client import models
+            vs = client.vector_store
+            result = vs.client.query_points(
+                collection_name=vs.collection_name,
+                query=embedding_client.embed_query(text),
+                query_filter=models.Filter(
+                    must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=agent_id))]
+                ),
+                limit=limit,
+                score_threshold=min_score,
+                with_payload=["data"],
+            )
+            return [(str(pt.id), float(pt.score), (pt.payload or {}).get("data", "")) for pt in result.points]
+
+        try:
+            return await asyncio.to_thread(_search)
+        except Exception as e:
+            logger.error(f"find_similar failed for {agent_id}: {e}", exc_info=True)
+            return []
+
+    async def update_text(self, memory_id: str, text: str, memory_type: str = "episodic",
+                          metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        就地改写一条记忆的正文（mem0 update：保留 created_at、刷新 updated_at、记入历史），
+        并恢复权重、补写 BM25（mem0 不写 BM25）。整理时"同一件事有了新进展"用它合并
+        """
+        if not self.enabled:
+            return False
+        client = self.brief_client if memory_type == "brief" else self.episodic_client
+        if not client:
+            return False
+        try:
+            await asyncio.to_thread(lambda: client.update(memory_id, text=text, metadata=metadata or {}))
+            now = datetime.utcnow().isoformat()
+            await asyncio.to_thread(
+                lambda: client.vector_store.client.set_payload(
+                    collection_name=client.vector_store.collection_name,
+                    payload={"decay_weight": 1.0, "last_reactivated_at": now},
+                    points=[memory_id],
+                )
+            )
+            await asyncio.to_thread(self._write_bm25_vectors, client, [{"id": memory_id, "memory": text}])
+            return True
+        except Exception as e:
+            logger.error(f"update_text failed for {memory_id}: {e}", exc_info=True)
+            return False
+
+    async def reactivate_ids(self, memory_ids: List[str], memory_type: str = "episodic") -> bool:
+        """
+        按 id 重激活（权重恢复 1.0，更新 updated_at / last_reactivated_at）。
+        整理经历时发现"这件事以前就记过"，用它代替重复写入；反思也据 updated_at 找到这些反复出现的事
+        """
+        if not self.enabled or not memory_ids:
+            return False
+        client = self.brief_client if memory_type == "brief" else self.episodic_client
+        if not client:
+            return False
+        now = datetime.utcnow().isoformat()
+        try:
+            await asyncio.to_thread(
+                lambda: client.vector_store.client.set_payload(
+                    collection_name=client.vector_store.collection_name,
+                    payload={"decay_weight": 1.0, "last_reactivated_at": now, "updated_at": now},
+                    points=list(memory_ids),
+                )
+            )
+            return True
+        except Exception as e:
+            logger.error(f"reactivate_ids failed: {e}", exc_info=True)
             return False
 
     async def mark_superseded(self, memory_id: str, superseded_by: str, memory_type: str = "brief") -> bool:

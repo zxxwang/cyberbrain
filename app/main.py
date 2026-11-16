@@ -34,7 +34,6 @@ from app.worker.decay_worker import decay_worker
 from app.worker.prefrontal_lobe_memory_worker import prefrontal_lobe_memory_worker
 from app.worker.thought_generator_worker import thought_generator_worker
 from app.worker.task_reminder_worker import task_reminder_worker
-from app.worker.reflection_worker import reflection_worker
 
 # 配置日志
 logging.basicConfig(
@@ -87,7 +86,6 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(prefrontal_lobe_memory_worker.start())
     asyncio.create_task(thought_generator_worker.start())
     asyncio.create_task(task_reminder_worker.start())
-    asyncio.create_task(reflection_worker.start())
 
     logger.info(f"Service started on {settings.HOST}:{settings.PORT}")
 
@@ -104,7 +102,6 @@ async def lifespan(app: FastAPI):
     prefrontal_lobe_memory_worker.stop()
     thought_generator_worker.stop()
     task_reminder_worker.stop()
-    reflection_worker.stop()
 
     # 关闭连接
     await redis_client.close()

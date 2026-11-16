@@ -1,19 +1,22 @@
 """
 Memory Gate Service: 记忆价值评估服务
 
-职责：
-- 使用 Doubao System One 评估输入信息的记忆价值（importance）
-- 使用 Doubao System One 分类记忆类型（memory_type）
-- 评估并持久化重要记忆到相应脑区
-- 根据对话内容更新 Situation 和 Overall State
+职责（对方的每句话，实时、后台）：
+- 评估记忆价值（importance）和类型（memory_type），作为标签写到工作记忆的这条记录上
+- 重激活相似的情景记忆
+- 把说话人本人的稳定个人信息融合进关系表的 profile
+- 根据重要信息更新 Situation 和 Overall State
+
+不写 Episodic / Brief：经历由工作记忆整理时提取（episode_consolidation_service），信念只由反思写入
 """
 import asyncio
 import logging
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from app.client.doubao_client import doubao_client
 from app.repository.memory_repository import memory_repository
+from app.service.prefrontal_lobe_memory import prefrontal_lobe_memory
 from app.repository.relationship_repository import PROFILE_SLOTS, relationship_repository
 from app.service.subjectivity_service import subjectivity_service
 from app.service.agent_life_event_service import agent_life_event_service
@@ -313,99 +316,49 @@ class MemoryGateService:
         agent_id: str,
         signal: str,
         speaker: str,
+        record_id: Optional[str] = None,
     ) -> None:
         """
-        评估输入信息的记忆价值，并持久化到相应脑区
+        对方这句话的实时处理（后台执行，不阻塞 react 返回）。
 
-        此方法适合异步调用，不阻塞主流程
+        不再写 Episodic：经历由工作记忆整理时统一提取（episode_consolidation_service），
+        那时看得到上下文和"我"说的话。这里只做必须实时的几件事：
+        1. 重激活：对方再次提起旧事，相似的情景记忆权重恢复、updated_at 更新（衰减和反思依赖它）
+        2. 打标签：把重要度、记忆类型写到工作记忆里这条记录上，整理经历时作为"第一印象"参考
+        3. 个人信息：说话人本人主动说出的稳定信息，融合进关系表的 profile，下一轮就能用上
+        4. 处境与状态：重要信息（如"明天要交方案"）马上影响处境和压力
 
         Args:
-            agent_id: Agent ID
-            signal: 用户输入信号
-            speaker: 说话人
+            record_id: 这句话在工作记忆里的记录 id，用于打标签
         """
         try:
             messages = [{"role": "user", "content": signal}]
-            # 1. 评估价值，同时做重激活：对方再次提到某件事时，相似的情景记忆权重恢复（不论这句话本身是否值得记）
-            #    重激活必须在本次写入之前做，否则会命中刚写入的这条
             gate_result, _ = await asyncio.gather(
                 self.evaluate(messages=messages),
                 memory_repository.reactivate_related(agent_id, messages, memory_type="episodic"),
             )
-
             importance = gate_result["importance"]
             memory_type = gate_result["memory_type"]
 
-            # 2. 分层持久化策略
-            # - importance 0: 丢弃，不记录
-            # - importance 1-2: 仅 PFC (工作记忆)，不写长期记忆
-            # - importance ≥ 3: Episodic (情景记忆)，不论判为 EPISODIC 还是 SEMANTIC
-            #
-            # 对话不直接写 Brief：Brief 是"我的信条"（对自我的判断），而对话里是"对方说的话"。
-            # 对方一句刺耳或重要的话落地时是经历，要过一段时间、经过反思才可能变成对自己的认识，
-            # 中间可能有完全不同的结论（自我怀疑、对关系的判断、对自我的认识，或者什么都没形成）。
-            # 直接铸成信条等于替 agent 决定了它该怎么被影响，而且 Brief 不衰减、不重激活、没有删除接口，
-            # 写进去就是永久的。所以这里只把"判为关于稳定事实的话"写进 Episodic，Brief 只由反思写入
+            # 第一印象标签：整理经历时 LLM 看得到"当时觉得这句话有多重要"，再结合上下文重新判断
+            if record_id:
+                await prefrontal_lobe_memory.tag(agent_id, record_id, {
+                    "importance": importance, "gate_type": memory_type,
+                })
 
-            if importance < 1:
-                logger.debug(
-                    f"Memory gate: signal importance={importance} (type={memory_type}), "
-                    f"discarded (threshold=1)"
-                )
-                return
-
-            # importance 1-2: 只记录到 PFC，不写入长期记忆
-            if importance < 3:
-                logger.info(
-                    f"Memory gate: signal importance={importance}, "
-                    f"recorded to PFC only (not persistent)"
-                )
-                # 注：PFC 记录已在 cyber_brain.react() 中完成
-                return
-
-            logger.info(
-                f"Memory gate: signal importance={importance} type={memory_type}, "
-                f"persisting to long-term memory..."
-            )
-
-            # 3. 持久化到情景记忆（判为 SEMANTIC 的也进 Episodic，只是多标一个 gate_type 供反思参考）
-            # 🔧 将 speaker 信息嵌入到内容中，避免 Mem0 抽取时丢失
-            if speaker and speaker != "user" and speaker != "self":
-                # Agent 间对话：标注说话人
-                enriched_content = f"{speaker}对我说：{signal}"
-            else:
-                enriched_content = signal
-
-            await memory_repository.add(
-                agent_id=agent_id,
-                messages=[{"role": "user", "content": enriched_content}],
-                memory_type="episodic",
-                metadata={
-                    "speaker": speaker,
-                    "importance": importance,
-                    "gate_type": memory_type,
-                    "source": "memory_gate",
-                    "timestamp": datetime.now().isoformat(),
-                }
-            )
-            logger.info(f"Persisted to EPISODIC(gate_type={memory_type}): {enriched_content[:50]}...")
-
-            # 注意：Knowledge 类型已从 Memory Gate 移除
-            # 知识习得通过 initialize agent 时显式调用 knowledge_memory_service.add_knowledge()
-
-            # 4. 个人信息：说话人本人主动说出的稳定信息，融合进关系表里这个人的 profile
-            #    （和"我住在北京"这类事实分开：那是一条经历，这是"我认识的这个人是谁"）
+            # 个人信息：只看这句话是否含有说话人的稳定信息，与重要度无关
             if gate_result.get("person_fact", 0.0) >= 0.6:
                 try:
                     await self._update_person_profile(agent_id, speaker, signal)
                 except Exception as e:
                     logger.error(f"Update person profile failed: {e}", exc_info=True)
 
-            # 5. 更新 Situation 和 Overall State（基于重要信息）
-            await self._update_situation_and_state(agent_id, signal, importance, memory_type)
+            # 处境与状态：只有重要的信息才值得改变处境
+            if importance >= 3:
+                await self._update_situation_and_state(agent_id, signal, importance, memory_type)
 
         except Exception as e:
-            logger.error(f"Failed to evaluate and persist memory: {e}", exc_info=True)
+            logger.error(f"Failed to evaluate memory gate: {e}", exc_info=True)
 
     async def _update_situation_and_state(
         self,

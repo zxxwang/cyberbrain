@@ -16,6 +16,7 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.client.doubao_client import doubao_client, start_usage_collection
@@ -471,7 +472,10 @@ class CyberBrain:
 
         # 3. 写入新信号到工作记忆，并获取完整上下文
         t_pfc = time.perf_counter()
-        await prefrontal_lobe_memory.append(agent_id, signal, role="user", speaker=speaker or "user")
+        # 记录 id：Memory Gate 和 System1 稍后给这条记录打上重要度、情绪标签，整理经历时参考
+        signal_record_id = uuid.uuid4().hex[:12]
+        await prefrontal_lobe_memory.append(agent_id, signal, role="user", speaker=speaker or "user",
+                                            record_id=signal_record_id)
         wm_records = await prefrontal_lobe_memory.get_records(agent_id)
         working_memory = format_records(wm_records)
         # System1 只给最近几条原文（不含刚写入的本句），控制长度，又能理解"需要""好的"这类省略回答
@@ -603,7 +607,11 @@ class CyberBrain:
 
         # 评估并持久化重要记忆：只影响以后的召回（本轮已回答完，下一轮靠 PFC 里的原文），放后台，不阻塞本轮返回。
         # "先重激活、再写入"的顺序在 evaluate_and_persist 内部保证
-        self._spawn(memory_gate_service.evaluate_and_persist(agent_id, signal, speaker or "user"))
+        self._spawn(memory_gate_service.evaluate_and_persist(agent_id, signal, speaker or "user", signal_record_id))
+        # 当时的情绪也作为标签记下（"编码时的情绪"），整理经历时用来判断这件事对我的分量
+        self._spawn(prefrontal_lobe_memory.tag(agent_id, signal_record_id, {
+            "emotion": emotion.get("emotion"), "intensity": round(float(emotion.get("intensity", 0.0)), 2),
+        }))
 
         # 判断是否生成待办：要调两次模型（System One + lite），放后台执行，不阻塞本轮返回。
         # 判断为"现在就该做"的联网任务，写入后立即执行，不等 worker 排期

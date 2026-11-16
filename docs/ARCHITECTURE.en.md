@@ -342,7 +342,7 @@ Brief is used only by System1 and System2.
 5. **Conflict ordering**: same rule as Brief, with newer `created_at` first
 6. Return the top `BRAIN_EPISODIC_TOP_K` (5) entries
 
-**Write sources:** Memory Gate (important experiences, with "{说话人}对我说：" ("{speaker} said to me:") prepended to the raw text), to-do execution results, summaries of proactive conversations, and the admin API.
+**Write sources:** [episode consolidation](#episode-consolidation-working-memory--episodic) (extracted from the raw working-memory text before rolling compression and during daily consolidation, `source: consolidation`), to-do execution results, summaries of proactive conversations, and the admin API. The Memory Gate no longer writes sentence by sentence.
 
 **Forgetting and reactivation:**
 
@@ -372,10 +372,10 @@ Each relationship records the other party's **type**: `kind = human` (a real per
 
 ### Working memory (PFC)
 
-`prefrontal_lobe_memory` uses two Redis Lists. Both are appended in time order, oldest to newest, with no timestamps (the relative order is the time order, which saves tokens).
+`prefrontal_lobe_memory` uses two Redis Lists. Both are appended in time order, oldest to newest. Each raw entry carries an `id` and `ts` (unix seconds), which are not rendered into the context, so they cost no tokens: `id` lets the Memory Gate and System1 tag the entry in the background with importance and emotion, and `ts` lets episode consolidation split events by time gaps and date them.
 
 - **Append** (hot path, no LLM call): each turn first writes what the other person said, then, after the reply is generated, writes what "I" said (or "（没有接话）" when silent). Each is one `RPUSH`
-- **Rolling compression**: when the `stm` length > `PFC_STM_MAX_LEN` (100), a background task uses an LLM to compress the oldest `PFC_STM_COMPRESS_COUNT` (50) entries into one summary block. It only reads first; only after compression succeeds does it run `LTRIM stm + RPUSH compress` in a transaction. If the LLM fails, the raw entries are kept. When there are more than `PFC_COMPRESS_MAX_BLOCKS` (16) compressed blocks, the two oldest are merged into one. The whole process holds a lock (`PFC_LOCK_TTL`, 300 seconds)
+- **Rolling compression**: when the `stm` length > `PFC_STM_MAX_LEN` (100), a background task handles the oldest `PFC_STM_COMPRESS_COUNT` (50) entries: it first [extracts episodes](#episode-consolidation-working-memory--episodic) into Episodic (the details are gone once summarized), then uses an LLM to compress them into one summary block. It only reads first; only after both steps succeed does it run `LTRIM stm + RPUSH compress` in a transaction. If either step fails, the raw entries are kept. When there are more than `PFC_COMPRESS_MAX_BLOCKS` (16) compressed blocks, the two oldest are merged into one. The whole process holds a lock (`PFC_LOCK_TTL`, 300 seconds)
 - **Read**: one pipeline reads both lists, compressed blocks first and raw entries after, rendered as `[speaker] content` lines. Compressed blocks are shown as `[摘要]` ("summary") and daily summaries as `[昨日日程]` ("yesterday's schedule")
 - **Daily consolidation**: see [PFC Worker](#pfc-worker-daily-consolidation-of-working-memory)
 
@@ -385,9 +385,14 @@ Working memory goes into System2 and System3, and is also used for speaker ident
 
 ## Memory Gate
 
-Implementation: `memory_gate_service.evaluate_and_persist()`. It runs in the background after each react turn has produced its reply, without blocking the return (it only affects later recall; the next turn relies on the raw text in working memory, not on this write), and **evaluates only what the other person said** (the signal), not "my" reply. Evaluation runs in parallel with Episodic [reactivation](#episodic-episodic-memory).
+Implementation: `memory_gate_service.evaluate_and_persist()`. It runs in the background after each react turn has produced its reply, without blocking the return, and **evaluates only what the other person said** (the signal). It **writes neither Episodic nor Brief**: episodes are extracted from the raw working-memory text by [episode consolidation](#episode-consolidation-working-memory--episodic) (which sees the context and what "I" said), and beliefs are written only by [reflection](#reflection-reflection-worker). It does only the four things that must happen in real time:
 
-**Evaluation:** one System One request asks two questions:
+1. **Reactivation**: runs in parallel with Episodic reactivation; when the other person brings up something again, similar episodes get their weight restored and `updated_at` refreshed (decay and reflection depend on it)
+2. **Tagging**: writes `importance` and `memory_type` onto this entry in working memory (by entry id, an atomic Lua update) as the "first impression" for consolidation; System1's emotion and intensity are tagged the same way
+3. **Personal information**: see profile below
+4. **Situation and state**: when `importance ≥ 3`, update the situation and overall state ("the proposal is due tomorrow" must raise stress right away)
+
+**Evaluation:** one System One request asks three questions:
 
 - `importance` (0–4, rounded to an integer):
   - 0: purely social / tone, nothing about the user
@@ -396,22 +401,13 @@ Implementation: `memory_gate_service.evaluate_and_persist()`. It runs in the bac
   - 3: a stable trait of the user (I am / I like), a completed event, a general rule of experience
   - 4: a safety / health constraint (allergies, things to avoid)
 - `memory_type`: `EPISODIC` (conversations, events, experiences, agreements, promises) or `SEMANTIC` (relatively stable identity, preferences, profile information, constraints)
+- `person_fact`: did the speaker volunteer stable information about themselves?
 
 If evaluation fails, it is treated as importance = 2, SEMANTIC.
 
-**Routing:**
-
-| Condition | Handling |
-|---|---|
-| importance < 3 | Not written to long-term memory (stays only in working memory) |
-| importance ≥ 3 (whether judged EPISODIC or SEMANTIC) | Write to Episodic, with `gate_type` kept in the metadata |
-| Contains stable personal information about the speaker (see below) | Merged into that person's profile in the relationship table |
-
 **A conversation never writes to Brief directly.** Brief is "my beliefs" (judgments about myself); what a conversation contains is "what the other person said". A weighty sentence lands as an experience, and only reflection (see [Reflection](#reflection-reflection-worker)) can turn it into a belief about myself. Casting it straight into a belief would decide for the agent how it should be affected, and Brief does not decay, is not reactivated, and has no delete API. Brief is therefore written only by initialization and by reflection.
 
-When the speaker is not `user` / `self`, the stored content is "{说话人}对我说：{原话}" ("{speaker} said to me: {original words}"), so the speaker is not lost. The metadata includes `speaker`, `importance`, `gate_type`, `source: memory_gate` and `timestamp`.
-
-**Personal information (profile):** evaluation also asks `person_fact` (did the speaker volunteer stable information about themselves?). At a probability ≥ 0.6, one LLM call extracts it into controlled slots (name, address, occupation, household, allergies… 16 in all, see `PROFILE_SLOTS`), and it is merged into that person's `profile` in the relationship table. The rules:
+**Personal information (profile):** when the `person_fact` probability is ≥ 0.6 (regardless of importance), one LLM call extracts it into controlled slots (name, address, occupation, household, allergies… 16 in all, see `PROFILE_SLOTS`), and it is merged into that person's `profile` in the relationship table. The rules:
 
 - **Strangers are ignored**: personal information from someone not in the relationship table is not recorded (a passer-by who announces their life story gets heard, but not diligently memorized)
 - **Dedup**: the same slot with the same value only bumps `mentions` and `last_confirmed_at`, adding no entry
@@ -423,6 +419,24 @@ When the speaker is not `user` / `self`, the stored content is "{说话人}对�
 When read, it goes to System1/2/3 together with the speaker description: `我对{人名}的了解（对方自己说过的，不是我自己的事）：- 住址：上海……`, kept clearly apart from "my beliefs".
 
 **Updating the situation after writing:** another System One request decides whether this information requires updating the situation. If so, `SITUATION_UPDATE_PROMPT` has the LLM output a new, complete situation JSON, which replaces the old one as a whole via `replace_situation()`. Each event in the new situation that is due within 3 days adds +0.1 to stress. If no update is needed, an overall state adjustment is still called once (with zero delta, which amounts to recomputing energy from the current stress).
+
+---
+
+## Episode Consolidation: Working Memory → Episodic
+
+Implementation: `app/service/episode_consolidation_service.py`. It corresponds to episodic consolidation during sleep: the day's conversations first stay in working memory, then are organized into experiences, one per event, and stored in long-term memory. Compared with judging sentence by sentence in real time:
+
+- **It sees the context**: a sentence alone can be worthless ("With me."), yet together with the previous one it is an event (who got the child after the divorce)
+- **What "I" said becomes part of experience too**: what I promised, refused, or said falsely (anything marked `[谎言]` is written down as a lie), so it can be recalled when someone follows up
+- **It merges with old experiences**: when the same event comes up again, the old episode is updated instead of stored twice; `updated_at` is refreshed, which is how reflection finds recurring events
+
+**Two entry points**, both handling "raw text about to leave working memory": before rolling compression (the oldest 50 entries are about to become a summary) and during daily consolidation (the rest of the day's raw text is about to become the daily summary). Raw text already rolled up was consolidated before compression, so daily consolidation only handles what remains in `stm`.
+
+**Extraction**: one LLM call (`EPISODE_PROMPT`), given the persona fragment and this batch of raw text (with speakers, lie markers and the Memory Gate's importance tags; a separator is inserted when two adjacent entries are more than 30 minutes apart). It splits by event and outputs `{content, speakers, importance, emotion, emotion_charge, has_commitment, has_lie}`; small talk and content-free Q&A are not kept. Episodes are written in the first person, name the other person, and include only what the raw text contains; place names, personal names, titles, numbers and times must be kept in the original words, neither dropped nor paraphrased (e.g. "大理洱海边上" must not become "by the lake" or just "Yunnan"), and the same applies when merging.
+
+**Merging**: the same event reworded scores a cosine of about 0.72–0.81, but "different people, similar events" (Zhang San's divorce / Li Si's divorce) also scores 0.73, so a threshold alone cannot separate them. As with to-do dedup, embeddings first narrow the field: up to 3 entries with cosine ≥ `EPISODE_MERGE_SIMILARITY` (0.65) become candidates, and then the LLM (`MERGE_PROMPT`) decides whether it is the same event. If it is and there is new progress, the two are rewritten as one, updated in place (mem0 update: `created_at` unchanged, `updated_at` refreshed, weight restored, BM25 rewritten); if there is nothing new, the old one is only reactivated. Otherwise a new entry is added, with `source: consolidation`, `speakers`, `occurred_at` (the date of the batch) and so on in the metadata.
+
+**Failure handling**: if the LLM call or parsing fails, it reports failure, and the caller neither compresses nor deletes the raw text, so it is retried next time.
 
 ---
 
@@ -590,9 +604,9 @@ The words are produced by System3 (with the speaking manner; the speaker is the 
 
 Implementation: `app/worker/reflection_worker.py`. It turns experiences into beliefs, modelling the replay and consolidation that happen during sleep. **Brief is written only by initialization and by this worker.**
 
-It runs once a day (`REFLECTION_WORKER_RUN_HOUR`, default 04:00 local time) and records the run time in Redis, so it does not run twice in a day, and a service restart does not trigger an extra run.
+**It is not scheduled on its own**: after daily consolidation (the PFC Worker) has processed every agent, it calls `run_once()`. Reflection must see the episodes consolidated and reactivated today, so it has to run after consolidation. The run time is recorded in Redis before running, so it does not run again within 20 hours.
 
-**Candidates**: Episodic memories whose `updated_at != created_at` (they were mentioned again; reactivation updates `updated_at`) and were updated within the last 24 hours. Fact-type entries (`gate_type = SEMANTIC`) are always included; experiences with `importance ≥ 3` are included according to `REFLECTION_INCLUDE_HIGH_IMPORTANCE`; system receipts (`type = task_completion`) are excluded. Sorted by importance, the top `REFLECTION_MAX_CANDIDATES` (30) are taken.
+**Candidates**: Episodic memories whose `updated_at != created_at` (they were mentioned again; reactivation updates `updated_at`) and were updated within the last 24 hours. Fact-type entries (consolidated episodes with `source = consolidation`, and `gate_type = SEMANTIC` entries written by the old Memory Gate) are always included; experiences with `importance ≥ 3` are included according to `REFLECTION_INCLUDE_HIGH_IMPORTANCE`; system receipts (`type = task_completion`) are excluded. Sorted by importance, the top `REFLECTION_MAX_CANDIDATES` (30) are taken.
 
 **Judgment**: one LLM call, given the persona fragment (`persona_system1`), every current Brief entry, and the candidate experiences (numbered). The prompt is `REFLECTION_PROMPT` and applies seven tests to each candidate: ownership (someone else's words are not a belief), stability (a one-off event is not a belief), independence, testability, non-duplication, non-transgression (personal facts belong in the profile), and non-self-harm (not copying someone's accusation into a judgment about oneself). The output is JSON: `{memory_ids, kind, action, target_index, text, reason, confidence}`.
 
@@ -605,7 +619,7 @@ The four workers are started with `asyncio.create_task()` when the service start
 | Worker | When it runs | Targets |
 |---|---|---|
 | Decay Worker | When `DECAY_WORKER_INTERVAL` (86400 seconds) has passed since the last run. The last run time is stored in Redis, so a restart does not trigger an extra run | All agents that appear in the Episodic collection |
-| PFC Worker | Every day at `PFC_DAILY_HOUR` (4) o'clock | All agents with working memory |
+| PFC Worker | Every day at `PFC_DAILY_HOUR` (4) o'clock; triggers reflection afterwards | All agents with working memory |
 | Thought Generator | **Waits** one `THOUGHT_GENERATOR_INTERVAL` (3600 seconds) after startup, then runs every interval | All agents with a subject context |
 | Task Reminder | **Runs once immediately at startup**, then every `TASK_REMINDER_INTERVAL` (3600 seconds) | All agents with a subject context |
 
@@ -620,11 +634,12 @@ Scheduling: the unix timestamp of the last run is stored in Redis under `worker:
 For each agent (sharing the lock with rolling compression; the lock duration is fixed at 3600 seconds):
 
 1. Using the current `stm` length as a cursor, read all compressed blocks and the raw entries before the cursor
-2. The LLM generates a first-person daily summary of at most 150 characters
-3. This one daily summary block (with all of the day's speakers) **replaces** the whole compressed queue, and the raw entries before the cursor are deleted (messages that arrive during consolidation are kept)
-4. New speakers from the previous day are added to the relationship table
+2. [Extract episodes](#episode-consolidation-working-memory--episodic) from the raw entries before the cursor into Episodic
+3. The LLM generates a first-person daily summary of at most 150 characters
+4. This one daily summary block (with all of the day's speakers) **replaces** the whole compressed queue, and the raw entries before the cursor are deleted (messages that arrive during consolidation are kept)
+5. New speakers from the previous day are added to the relationship table
 
-If the LLM fails, nothing is cleaned up, and the data waits for the next run. The daily summary stays only in working memory and is not written to long-term memory.
+If episode consolidation or the summary fails, nothing is cleaned up, and the data waits for the next run. The daily summary stays only in working memory and is not written to long-term memory. After every agent is processed, [reflection](#reflection-reflection-worker) is triggered.
 
 ### Thought Generator and Task Reminder
 

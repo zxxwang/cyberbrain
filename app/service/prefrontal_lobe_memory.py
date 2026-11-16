@@ -5,17 +5,22 @@ Prefrontal Lobe Memory: 前额叶工作记忆（短时记忆）
 - wm:{agent_id}:stm           原始短时记忆，每条一个JSON
 - wm:{agent_id}:stm:compress  压缩块，每块一个JSON（摘要）
 
-不存时间戳：list的相对顺序即时间先后，省掉日期可减少上下文和压缩的token消耗。
+每条原文记录带 id 和 ts（unix 秒），但渲染上下文（format_records）时不输出，不增加 token：
+- id：Memory Gate 在后台评估完这句话后，按 id 给它打上重要度、情绪等标签，供整理经历时参考
+- ts：整理经历时按时间间隔切分对话片段，并给经历标上发生日期
 
 流程：
 - append: RPUSH入stm，长度超过PFC_STM_MAX_LEN时异步压缩最早的PFC_STM_COMPRESS_COUNT条
-- compress: 先LRANGE只读 -> LLM压缩 -> 事务内LTRIM stm + RPUSH compress（成功后才删原文）
+- compress: 先LRANGE只读 -> 从这批原文里整理出经历写入 Episodic -> LLM压缩
+  -> 事务内LTRIM stm + RPUSH compress（成功后才删原文；整理经历失败也不压缩，原文保留）
 - get_context: 一次pipeline读两个list，compress在前、stm在后拼成时间线
 热路径（append/get_context）不调用LLM。
 """
 import asyncio
 import json
 import logging
+import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 from app.client.doubao_client import doubao_client
@@ -39,6 +44,22 @@ def compress_key(agent_id: str) -> str:
 
 def lock_key(agent_id: str) -> str:
     return f"{KEY_PREFIX}{{{agent_id}}}:lock"
+
+
+# 按 id 找到 stm 里的那条记录，把标签合并进去（原子操作，不需要锁；找不到说明已被压缩，返回 0）
+_TAG_SCRIPT = """
+local items = redis.call('LRANGE', KEYS[1], 0, -1)
+for i, raw in ipairs(items) do
+  local ok, rec = pcall(cjson.decode, raw)
+  if ok and type(rec) == 'table' and rec['id'] == ARGV[1] then
+    local tags = cjson.decode(ARGV[2])
+    for k, v in pairs(tags) do rec[k] = v end
+    redis.call('LSET', KEYS[1], i - 1, cjson.encode(rec))
+    return 1
+  end
+end
+return 0
+"""
 
 
 def format_records(records: List[Dict[str, Any]]) -> str:
@@ -77,18 +98,22 @@ class PrefrontalLobeMemory:
         role: str = "user",
         speaker: Optional[str] = None,
         lies: Optional[List[str]] = None,
+        record_id: Optional[str] = None,
     ) -> int:
         """
         追加一条短时记忆（热路径：一次RPUSH）
 
         Args:
             lies: content中"我"有意撒谎的句子，渲染上下文时会重新标出，供圆谎和每日巩固识别
+            record_id: 记录 id，不传时自动生成；调用方需要稍后给这条记录打标签时传入
 
         Returns:
             追加后stm的长度
         """
         record = {
             "type": "raw",
+            "id": record_id or uuid.uuid4().hex[:12],
+            "ts": int(time.time()),
             "role": role,
             "speaker": speaker,
             "content": content,
@@ -100,6 +125,18 @@ class PrefrontalLobeMemory:
         if length > settings.PFC_STM_MAX_LEN:
             self._spawn(self.compress(agent_id))
         return length
+
+    async def tag(self, agent_id: str, record_id: str, tags: Dict[str, Any]) -> bool:
+        """给 stm 里的一条记录合并标签（如 Memory Gate 的重要度、System1 的情绪）。记录已被压缩时返回 False"""
+        if not record_id or not tags:
+            return False
+        try:
+            found = await redis_client.client.eval(
+                _TAG_SCRIPT, 1, stm_key(agent_id), record_id, json.dumps(tags, ensure_ascii=False))
+            return bool(found)
+        except Exception as e:
+            logger.warning(f"Tag PFC record {record_id} failed for {agent_id}: {e}")
+            return False
 
     def _spawn(self, coro) -> None:
         task = asyncio.create_task(coro)
@@ -127,6 +164,12 @@ class PrefrontalLobeMemory:
                 raw = await redis_client.lrange(stm_key(agent_id), 0, settings.PFC_STM_COMPRESS_COUNT - 1)
                 records = [json.loads(r) for r in raw]
                 if not records:
+                    break
+
+                # 原文被压成摘要之前，先把其中值得长期记住的经历整理进 Episodic（压缩后细节就没了）
+                from app.service.episode_consolidation_service import episode_consolidation_service
+                if await episode_consolidation_service.consolidate(agent_id, records) is None:
+                    logger.error(f"Episode consolidation failed for {agent_id}, keep raw records uncompressed")
                     break
 
                 summary = await self._summarize(records)

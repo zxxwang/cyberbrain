@@ -3,15 +3,16 @@ Prefrontal Lobe Memory Worker: 每日凌晨的工作记忆整理
 
 职责（每天 PFC_DAILY_HOUR 点，对每个agent）：
 1. 读取 wm:{agent_id}:stm 剩余记录 + wm:{agent_id}:stm:compress 全部块
-2. 使用 LLM 压缩成简洁的当日摘要（不提取 episodes）
-3. 将当日摘要放入 compress 队列
+2. 从 stm 原文里整理出经历写入 Episodic（episode_consolidation_service），失败则本次不整理、原文保留
+3. 使用 LLM 压缩成简洁的当日摘要，放入 compress 队列
 4. 清理：stm 只删除参与整理的那部分，整理期间新到的消息保留
+5. 全部 agent 整理完后触发反思（reflection_worker）：反思要看到今天刚整理、刚重激活的经历
 
 注意：
-- 使用 LLM 压缩当日对话，生成简洁摘要
-- 不再提取和升级 episodes（由 Memory Gate 在 react 时实时处理）
+- 经历在这里（以及滚动压缩前）提取，而不是 Memory Gate 逐句实时写：整理时看得到上下文和"我"说的话
+- 已被滚动压缩掉的原文，在压缩前就已经整理过经历，这里只处理 stm 里剩下的原文
 - compress 摘要用于工作记忆召回，让 AI 快速了解历史上下文
-- Situation 由 Memory Gate 实时更新，不再在此处更新
+- Situation 由 Memory Gate 实时更新，不在此处更新
 """
 import asyncio
 import json
@@ -131,6 +132,14 @@ class PrefrontalLobeMemoryWorker:
             if not records:
                 return {"records": 0}
 
+            # 原文被压成当日摘要之前，先整理出经历（压缩块里的原文在滚动压缩前已经整理过）
+            from app.service.episode_consolidation_service import episode_consolidation_service
+            stm_records = [json.loads(r) for r in stm_raw]
+            episode_result = await episode_consolidation_service.consolidate(agent_id, stm_records)
+            if episode_result is None:
+                logger.error(f"Episode consolidation failed for {agent_id}, keep all records")
+                return {"records": len(records)}
+
             # 使用 LLM 生成当日摘要（不提取 episodes）
             date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
             daily_summary = await self._compress_daily_summary(date, records)
@@ -167,8 +176,9 @@ class PrefrontalLobeMemoryWorker:
             # 记录今天遇到的新陌生人到人际关系表
             await self._record_new_strangers(agent_id, records, date)
 
-            logger.info(f"Daily consolidation for {agent_id}: {len(records)} records -> daily summary ({len(daily_summary)} chars)")
-            return {"records": len(records)}
+            logger.info(f"Daily consolidation for {agent_id}: {len(records)} records -> daily summary "
+                        f"({len(daily_summary)} chars), episodes {episode_result}")
+            return {"records": len(records), **episode_result}
 
         finally:
             await redis_client.release_lock(lock)
@@ -272,9 +282,11 @@ class PrefrontalLobeMemoryWorker:
                 # 等待到目标时间
                 await asyncio.sleep(wait_seconds)
 
-                # 执行压缩
+                # 执行整理，随后反思：反思要基于今天刚整理、刚重激活的经历，必须排在整理之后
                 if self.running:
                     await self.consolidate_all_agents()
+                    from app.worker.reflection_worker import reflection_worker
+                    await reflection_worker.run_once()
 
             except Exception as e:
                 logger.error(f"Error in prefrontal worker loop: {e}", exc_info=True)

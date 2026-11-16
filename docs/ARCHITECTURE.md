@@ -335,7 +335,7 @@ Brief 只用于 System1 和 System2。
 5. **冲突排序**：规则同 Brief，按 `created_at` 新的排前面
 6. 返回前 `BRAIN_EPISODIC_TOP_K`（5）条
 
-**写入来源：** Memory Gate（重要经历，原文前加"{说话人}对我说："）、待办执行结果、主动对话摘要、管理接口。
+**写入来源：** [经历整理](#经历整理工作记忆--episodic)（滚动压缩前、每日整理时从工作记忆原文提取，`source: consolidation`）、待办执行结果、主动对话摘要、管理接口。Memory Gate 不再逐句写入。
 
 **遗忘与重激活：**
 
@@ -365,10 +365,10 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 ### 工作记忆（PFC）
 
-`prefrontal_lobe_memory`，两个 Redis List，均按时间从旧到新追加，不存时间戳（相对顺序即时间先后，节省 token）。
+`prefrontal_lobe_memory`，两个 Redis List，均按时间从旧到新追加。每条原文记录带 `id` 和 `ts`（unix 秒），但渲染上下文时不输出，不增加 token：`id` 供 Memory Gate 和 System1 在后台给这条记录打上重要度、情绪标签，`ts` 供经历整理按时间间隔切分事件、标注发生日期。
 
 - **追加**（热路径，不调用 LLM）：每轮先写对方的话，生成回应后再写"我"的话（沉默时写"（没有接话）"），各一次 `RPUSH`
-- **滚动压缩**：`stm` 长度 > `PFC_STM_MAX_LEN`（100）时，在后台任务中把最早的 `PFC_STM_COMPRESS_COUNT`（50）条用 LLM 压缩成一个摘要块。先只读、压缩成功后才在事务里 `LTRIM stm + RPUSH compress`，LLM 失败时原文保留。压缩块超过 `PFC_COMPRESS_MAX_BLOCKS`（16）时，把最早两块合并为一块。全程加锁（`PFC_LOCK_TTL`，300 秒）
+- **滚动压缩**：`stm` 长度 > `PFC_STM_MAX_LEN`（100）时，在后台任务中处理最早的 `PFC_STM_COMPRESS_COUNT`（50）条：先[整理出经历](#经历整理工作记忆--episodic)写入 Episodic（压成摘要后细节就没了），再用 LLM 压缩成一个摘要块。先只读、两步都成功后才在事务里 `LTRIM stm + RPUSH compress`，任一步失败时原文保留。压缩块超过 `PFC_COMPRESS_MAX_BLOCKS`（16）时，把最早两块合并为一块。全程加锁（`PFC_LOCK_TTL`，300 秒）
 - **读取**：一次 pipeline 读两个 list，压缩块在前、原文在后，渲染成 `[说话人] 内容` 的行。压缩块显示为 `[摘要]`，当日摘要显示为 `[昨日日程]`
 - **每日整理**：见 [PFC Worker](#pfc-worker工作记忆每日整理)
 
@@ -378,9 +378,14 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 ## Memory Gate：记忆门控
 
-实现：`memory_gate_service.evaluate_and_persist()`。每轮 react 生成回复后在后台执行，不阻塞本轮返回（它只影响以后的召回；下一轮靠工作记忆里的原文，不依赖它写完），**只评估对方说的话**（signal），不评估"我"的回应。评估与 Episodic [重激活](#episodic情景记忆)并行进行。
+实现：`memory_gate_service.evaluate_and_persist()`。每轮 react 生成回复后在后台执行，不阻塞本轮返回，**只评估对方说的话**（signal）。它**不写 Episodic，也不写 Brief**：经历由[经历整理](#经历整理工作记忆--episodic)从工作记忆原文中提取（那时看得到上下文和"我"说的话），信念只由[反思](#反思reflection-worker)写入。这里只做必须实时的四件事：
 
-**评估**：一次 System One 请求问两个问题：
+1. **重激活**：与 Episodic 重激活并行；对方再次提起旧事时，相似经历权重恢复、`updated_at` 更新（衰减和反思依赖它）
+2. **打标签**：把 `importance`、`memory_type` 写到工作记忆里这条记录上（按记录 id，Lua 原子更新），作为整理经历时的"第一印象"参考；System1 的情绪与强度也同样标上
+3. **个人信息**：见下文 profile
+4. **处境与状态**：`importance ≥ 3` 时更新处境和整体状态（"明天要交方案"要马上让压力上升）
+
+**评估**：一次 System One 请求问三个问题：
 
 - `importance`（0–4 分，四舍五入为整数）：
   - 0：纯社交 / 语气，与用户本身无关
@@ -389,22 +394,13 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
   - 3：用户的稳定特征（我是 / 我喜欢）、已完成的事件、通用经验规律
   - 4：安全 / 健康约束（过敏、禁忌）
 - `memory_type`：`EPISODIC`（对话、事件、经历、约定、承诺）或 `SEMANTIC`（相对稳定的身份、偏好、资料、约束）
+- `person_fact`：说话人有没有主动说出关于他自己的稳定个人信息
 
 评估失败时按 importance = 2、SEMANTIC 处理。
 
-**分流：**
-
-| 条件 | 处理 |
-|---|---|
-| importance < 3 | 不写长期记忆（只留在工作记忆里） |
-| importance ≥ 3（不论判为 EPISODIC / SEMANTIC） | 写入 Episodic，metadata 多存一个 `gate_type` |
-| 含说话人本人的稳定个人信息（见下） | 融合进关系表里这个人的 profile |
-
 **对话不直接写 Brief。** Brief 是"我的信条"（对自我的判断），对话里是"对方说的话"。对方一句重要的话落地时是经历，要经过反思（见[反思](#反思reflection-worker)）才可能变成对自己的认识。直接铸成信条等于替 agent 决定了它该怎么被影响，而且 Brief 不衰减、不重激活、没有删除接口。所以 Brief 只由初始化和反思写入。
 
-说话人不是 `user` / `self` 时，写入内容为"{说话人}对我说：{原话}"，避免丢失说话人。metadata 包含 `speaker`、`importance`、`gate_type`、`source: memory_gate`、`timestamp`。
-
-**个人信息（profile）：** 评估时多问一个 `person_fact`（这句话里说话人有没有主动说出关于他自己的稳定信息）。概率 ≥ 0.6 时，用一次 LLM 抽取到受控槽位（姓名、住址、职业、家庭成员、过敏与禁忌……共 16 个，见 `PROFILE_SLOTS`），融合进关系表里这个人的 `profile`。规则：
+**个人信息（profile）：** `person_fact` 概率 ≥ 0.6 时（与重要度无关），用一次 LLM 抽取到受控槽位（姓名、住址、职业、家庭成员、过敏与禁忌……共 16 个，见 `PROFILE_SLOTS`），融合进关系表里这个人的 `profile`。规则：
 
 - **陌生人忽略**：不在关系表里的人说了个人信息也不记（路人一上来就说自己的事，人也会听着、但不会认真记下）
 - **去重**：同一槽位、同一值只累计 `mentions` 和 `last_confirmed_at`，不新增条目
@@ -416,6 +412,24 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 读取时随说话人描述一起给 System1/2/3：`我对{人名}的了解（对方自己说过的，不是我自己的事）：- 住址：上海……`，与"我的信条"明确分开。
 
 **写入后更新处境：** 再发一次 System One 请求，判断这条信息是否需要更新处境。需要时用 `SITUATION_UPDATE_PROMPT` 让 LLM 输出新的完整处境 JSON，通过 `replace_situation()` 整体替换保存；新处境中 3 天内到期的每个事件让压力 +0.1。不需要更新时也会调用一次整体状态调整（增量为 0，相当于按当前压力重算精力）。
+
+---
+
+## 经历整理：工作记忆 → Episodic
+
+实现：`app/service/episode_consolidation_service.py`。对应人在睡眠中的情景记忆巩固：白天的对话先留在工作记忆里，再按"一件事"整理成经历存进长期记忆。和逐句实时判断相比：
+
+- **看得到上下文**：单独一句没价值（"跟我。"），和上一句连起来才是一件事（离婚后孩子跟谁）
+- **"我"说过的话也进经历**：答应了什么、拒绝了什么、哪句是假话（带 `[谎言]` 标记的会写明是假话），以后被追问时才想得起来
+- **与旧经历合并**：同一件事再次被提起时，更新旧经历而不是重复存；`updated_at` 随之更新，反思据此找到反复发生的事
+
+**两个入口**，处理的都是"即将从工作记忆里消失的原文"：滚动压缩之前（最早的 50 条要被压成摘要）、每日整理时（当天剩下的原文要被压成当日摘要）。已被滚动压缩的原文在压缩前已整理过，每日整理只处理 `stm` 里剩下的部分。
+
+**提取**：一次 LLM 调用（`EPISODE_PROMPT`），输入是人格片段和这批原文（带说话人、谎言标记、Memory Gate 的重要度标签；相邻两句间隔超过 30 分钟时插入分隔）。按事件切分，输出 `{content, speakers, importance, emotion, emotion_charge, has_commitment, has_lie}`；寒暄、无实质内容的问答不记。经历用第一人称写，写清楚对方的名字，只写原文里有的内容；地名、人名、书名、数字、时间必须照原文的字写，不省略、不换说法（如不能把"大理洱海边上"写成"洱海边"或"云南"），合并时同样保留。
+
+**合并**：同一件事换个说法，余弦约 0.72–0.81；但"不同的人、类似的事"（张三离婚 / 李四离婚）也有 0.73，单靠阈值分不开。所以和待办去重一样，先用 embedding 粗筛：余弦 ≥ `EPISODE_MERGE_SIMILARITY`（0.65）的最多 3 条作为候选，再由 LLM（`MERGE_PROMPT`）判断是不是同一件事。是同一件事且有新进展时，把两条合写成一条，就地改写（mem0 update，`created_at` 不变、`updated_at` 刷新、权重恢复、补写 BM25）；没有新内容时只重激活。不是同一件事则新增，metadata 带 `source: consolidation`、`speakers`、`occurred_at`（这批对话的日期）等。
+
+**失败处理**：LLM 调用或解析失败时返回失败，调用方不压缩、不删除原文，下次再整理。
 
 ---
 
@@ -579,9 +593,9 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 
 实现：`app/worker/reflection_worker.py`。把经历沉淀成信念，模拟人在睡眠中的记忆重放与巩固。**Brief 只由初始化和这里写入。**
 
-每天跑一次（`REFLECTION_WORKER_RUN_HOUR`，默认 04:00，本地时间）；跑完把时间记进 Redis，当天不会重复跑，服务重启也不会额外触发。
+**不单独定时**：每日整理（PFC Worker）把所有 agent 的经历整理完后调用 `run_once()`。反思要看到今天刚整理出、刚被重激活的经历，必须排在整理之后。执行前先把时间记进 Redis，20 小时内不会重复执行。
 
-**候选**：Episodic 中 `updated_at != created_at`（被重新提起过；重激活时会更新 `updated_at`）且 24 小时内更新过的记忆。事实型（`gate_type = SEMANTIC`）必选；`importance ≥ 3` 的经历按 `REFLECTION_INCLUDE_HIGH_IMPORTANCE` 纳入；`type = task_completion` 的系统回执排除。按重要性排序取前 `REFLECTION_MAX_CANDIDATES`（30）条。
+**候选**：Episodic 中 `updated_at != created_at`（被重新提起过；重激活时会更新 `updated_at`）且 24 小时内更新过的记忆。事实型（整理出的经历 `source = consolidation`，以及旧版 Memory Gate 写入的 `gate_type = SEMANTIC`）必选；`importance ≥ 3` 的经历按 `REFLECTION_INCLUDE_HIGH_IMPORTANCE` 纳入；`type = task_completion` 的系统回执排除。按重要性排序取前 `REFLECTION_MAX_CANDIDATES`（30）条。
 
 **判断**：一次 LLM 调用，输入是人格片段（`persona_system1`）、全部现有 Brief、候选经历（带编号）。提示词见 `REFLECTION_PROMPT`，按七条标准逐条判定：归属（别人的话不是信念）、稳定性（一次性事件不是信念）、独立性、可检验性、不重复、不越界（个人事实归 profile）、不反噬（不把别人的指责照搬成对自己的判断）。输出 JSON：`{memory_ids, kind, action, target_index, text, reason, confidence}`。
 
@@ -594,7 +608,7 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 | Worker | 执行时机 | 对象 |
 |---|---|---|
 | Decay Worker | 距上次执行满 `DECAY_WORKER_INTERVAL`（86400 秒）时执行；上次执行时间记在 Redis，重启不会额外触发 | Episodic 集合中出现过的所有 agent |
-| PFC Worker | 每天 `PFC_DAILY_HOUR`（4）点 | 有工作记忆的所有 agent |
+| PFC Worker | 每天 `PFC_DAILY_HOUR`（4）点；整理完后触发反思 | 有工作记忆的所有 agent |
 | Thought Generator | 启动后**先等待**一个 `THOUGHT_GENERATOR_INTERVAL`（3600 秒），之后每个间隔执行 | 有主体性上下文的所有 agent |
 | Task Reminder | **启动时立即执行一次**，之后每 `TASK_REMINDER_INTERVAL`（3600 秒） | 有主体性上下文的所有 agent |
 
@@ -609,11 +623,12 @@ Redis Hash，只做精确的人名匹配，用于[说话人识别](#说话人识
 对每个 agent（与滚动压缩共用锁，锁时长固定 3600 秒）：
 
 1. 以当前 `stm` 长度为游标，读取全部压缩块和游标之前的原文
-2. LLM 生成一段 150 字以内的第一人称当日摘要
-3. 用这一块当日摘要（带当天所有说话人）**替换**整个压缩队列，删除游标之前的原文（整理期间新到的消息保留）
-4. 把前一天出现过的新说话人记入人际关系表
+2. 从游标之前的原文中[整理出经历](#经历整理工作记忆--episodic)写入 Episodic
+3. LLM 生成一段 150 字以内的第一人称当日摘要
+4. 用这一块当日摘要（带当天所有说话人）**替换**整个压缩队列，删除游标之前的原文（整理期间新到的消息保留）
+5. 把前一天出现过的新说话人记入人际关系表
 
-LLM 失败时不做任何清理，数据留到下一次。当日摘要只留在工作记忆中，不写入长期记忆。
+经历整理或摘要失败时不做任何清理，数据留到下一次。当日摘要只留在工作记忆中，不写入长期记忆。所有 agent 整理完后触发[反思](#反思reflection-worker)。
 
 ### Thought Generator 与 Task Reminder
 

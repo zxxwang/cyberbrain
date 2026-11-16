@@ -65,7 +65,7 @@ RUNTIME_CONFIGS: Dict[str, RuntimeConfigSpec] = {
     "BRAIN_SYSTEM3_MAX_TOKENS": RuntimeConfigSpec("System3最大输出token数", 1, 32000),
     "BRAIN_ROUTE_REASONING_THRESHOLD": RuntimeConfigSpec("路由：System1判断needs_reasoning≥此值时走System2", 0, 1),
     "BRAIN_ROUTE_MEMORY_THRESHOLD": RuntimeConfigSpec("路由：needs_memory≥此值时带回忆", 0, 1),
-    "REFLECTION_WORKER_RUN_HOUR": RuntimeConfigSpec("反思：每天几点跑（0-23，本地时间）", 0, 23),
+    "EPISODE_MERGE_SIMILARITY": RuntimeConfigSpec("整理经历：与已有经历余弦≥此值的作为合并候选，再由LLM判断是否同一件事", 0, 1),
     "REFLECTION_MAX_CANDIDATES": RuntimeConfigSpec("反思：每个 agent 每轮最多看多少条经历", 1, 200),
     "REFLECTION_MAX_ACTIONS": RuntimeConfigSpec("反思：每轮最多写入/修正几条信念", 0, 10),
     "REFLECTION_MIN_CONFIDENCE": RuntimeConfigSpec("反思：低于此置信度的信念不写入", 0, 1),

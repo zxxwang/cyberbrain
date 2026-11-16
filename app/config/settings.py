@@ -120,8 +120,8 @@ class Settings(BaseSettings):
     THOUGHT_GENERATOR_INTERVAL: int = 3600  # 念头生成间隔（秒），默认1小时
     TASK_REMINDER_INTERVAL: int = 3600  # 待办任务检查间隔（秒），默认1小时
 
-    # 反思：每天把被重新提起的经历沉淀成信念（Brief 只由这里写入）
-    REFLECTION_WORKER_RUN_HOUR: int = 4  # 每天几点跑（本地时间，24 小时制）
+    # 反思：每日整理完经历后，把被重新提起的经历沉淀成信念（Brief 只由这里写入；执行时间跟随 PFC_DAILY_HOUR）
+    EPISODE_MERGE_SIMILARITY: float = 0.65  # 整理经历时的合并粗筛：与已有经历余弦≥此值的作为候选，再由 LLM 判断是否同一件事
     REFLECTION_MAX_CANDIDATES: int = 30  # 每个 agent 每轮最多看多少条经历
     REFLECTION_MAX_ACTIONS: int = 2  # 每轮最多写入/修正几条信念（有界步长）
     REFLECTION_MIN_CONFIDENCE: float = 0.75  # 低于此置信度一律不写
