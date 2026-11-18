@@ -36,7 +36,7 @@ SITUATION_TYPES = {
     "开玩笑调侃": "调侃、打趣、不正经、互损",
     "质疑批评": "对我的观点、行为、作品提出异议或不满",
     "冒犯挑衅": "贬低、否定、攻击、羞辱、为难",
-    "提及共同经历": "说起我们之间发生过的事、之前的约定或承诺",
+    "提及共同经历": "说起或问起我们之间发生过的事、之前的约定或承诺",
 }
 
 # 对方意图：只描述对方在干什么，不含"我"的态度
@@ -45,14 +45,14 @@ USER_INTENTS = {
     "闲聊": "随便聊聊天气、日常、见闻",
     "开玩笑": "调侃、损人、逗乐",
     "分享近况": "说自己的事、好消息或坏消息",
-    "提问": "问一个事实、知识或看法",
+    "提问": "问一个事实、知识或看法（问的是我们过去的事，归提起往事）",
     "求助": "请我帮忙做事、借东西、要技术指导",
     "征求意见": "问我该怎么办、怎么选",
     "倾诉": "诉苦、难过、需要安慰",
     "邀约": "约吃饭、约见面、约活动",
     "批评质疑": "否定我、我的作品或我的观点",
     "挑衅冒犯": "带恶意地攻击、羞辱、为难我",
-    "提起往事": "说起过去发生的事、之前的约定",
+    "提起往事": "说起或问起过去发生的事、之前的约定（包括问我还记不记得过去某件事的细节）",
     "正常讨论观点": "表达不同观点但不是在找茬，可以正常讨论",
     "其他": "以上都不是",
 }
@@ -90,6 +90,7 @@ class System1Tev1:
         situation_context: str = "",  # 🔥 主体性上下文（overall_state + situation）
         recent_dialogue: str = "",  # 最近几条对话原文（不含本句）
         knowledge_hint: str = "",  # 我对这个话题掌握的资料（只有标题），或"没有相关资料"
+        state_words: str = "",  # 我此刻的整体状态（文字），紧挨信号放
     ) -> Dict[str, Any]:
         """
         分析外部信号的情绪反应
@@ -107,15 +108,23 @@ class System1Tev1:
 
         Returns:
             {
-                "emotion": str,         # 主情绪
-                "intensity": float,     # 强度 0-1
-                "impulse": str,         # 第一冲动
-                "valence": float,       # 效价 -1~1
-                "arousal": float,       # 唤醒度 0-1
-                "dominance": float,     # 掌控感 -1~1
-                "requires_knowledge": bool, # 是否需要技能召回
-                "expectation_violated": bool  # 预期违背（突兀）
+                "situation": str,             # 场景性质（SITUATION_TYPES 之一）
+                "emotion": str,               # 主情绪：16 个选项里概率最高的
+                "emotion_probs": dict,        # 情绪概率最高的前 3 个 {情绪: 概率}，只用于观测（写入 trace）。
+                                              # 这是"选哪一个"的确定程度，不是几种情绪同时存在的比例；实测多数时候第一名 ≥ 0.9
+                "intensity": float,           # 强度 0-1
+                "impulse": str,               # 第一冲动
+                "engagement": float,          # 投入意愿 0-1
+                "conflict": float,            # 与我的价值观、在意的事的冲突 0-1
+                "requires_knowledge": bool,   # 是否需要专业知识
+                "user_intent": str,           # 对方意图（USER_INTENTS 之一）
+                "quick_action": str,          # 直觉行为（去掉"得想一想"后概率最高的）
+                "action_confidence": float,   # 直觉行为的概率
+                "think_prob": float,          # "得想一想"的概率，路由用
+                "needs_memory": float,        # 是否必须想起具体往事，路由用
+                "needs_reasoning": float,     # 是否需要停下来想，路由用
             }
+            效价、唤醒度不单独输出：它们对整体状态的影响见 cyber_brain.EMOTION_STATE_EFFECT
         """
         try:
             # 构建上下文：说话人放最前、并在信号前再点一次（小模型对靠前和紧邻信号的内容权重更高）
@@ -133,6 +142,9 @@ class System1Tev1:
             # 刚才的对话紧挨在信号前：省略回答要结合上一句才能理解（小模型对紧邻信号的内容权重更高）
             if recent_dialogue:
                 context += f"【刚才的对话】（按时间先后，越靠后越新）\n{recent_dialogue}\n\n"
+            # 我此刻的状态紧挨在信号前，用文字：同一句话，心情差、压力大、疲惫时和状态好时的反应不一样
+            if state_words:
+                context += f"【我此刻的状态】{state_words}\n\n"
             context += f"【外部信号】（说话人：{speaker_line.split('（')[0]}）\n{signal}"
 
             # 批量决策（使用 System One API）
@@ -149,6 +161,10 @@ class System1Tev1:
                         "instructions": "基于刚才判断的场景（situation），结合对方是谁、我和对方的关系，此刻的主要情绪是什么？\n"
                                         "关键原则：\n"
                                         "- 先理解这句话对我的意义，再结合人格、关系和当前状态产生情绪。\n"
+                                        "- 情绪是对这句话的反应。关系里对对方的长期牵挂、担心是背景，只有这句话触及那件事时才会被激起；"
+                                        "对方说的是别的事，就按这句话本身反应。\n"
+                                        "- 我此刻的状态会影响反应：心情差、压力大、疲惫时，同一句话更容易让我烦躁、敏感或提不起劲；"
+                                        "状态好时更宽容、更容易高兴。\n"
                                         "- '正常交流'或'表达关心'场景：通常是平静、困惑，但根据话题意义也可能担忧、喜悦、焦虑等。\n"
                                         "- '质疑批评'或'冒犯挑衅'场景：才可能是厌恶、愤怒。\n"
                                         "- 场景类型只是参考，不直接决定情绪。",
@@ -210,7 +226,8 @@ class System1Tev1:
                     },
                     "engagement": {
                         "type": "score",
-                        "instructions": "此刻有多想跟对方多聊？（亲密关系话匣子容易打开，陌生人自然不想多说）",
+                        "instructions": "此刻有多想跟对方多聊？（亲密关系话匣子容易打开，陌生人自然不想多说；"
+                                        "疲惫、心情差时也不太想多说）",
                         "criteria": ["完全不想聊", "只想应付一两句", "正常交流", "愿意多聊几句", "话匣子打开了"]
                     },
                     "conflict": {
@@ -266,6 +283,8 @@ class System1Tev1:
             emotion = {
                 "situation": answers["situation"]["choice"],
                 "emotion": answers["emotion"]["choice"],
+                "emotion_probs": {k: round(v, 3) for k, v in sorted(
+                    (answers["emotion"].get("probabilities") or {}).items(), key=lambda x: -x[1])[:3]},
                 "intensity": self._map_score_to_range(answers["intensity"]["score"], 0.0, 1.0),
                 "impulse": answers["impulse"]["choice"],
                 "engagement": self._map_score_to_range(answers["engagement"]["score"], 0.0, 1.0),

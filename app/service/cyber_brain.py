@@ -33,7 +33,7 @@ from app.repository.relationship_repository import (
     relationship_repository,
 )
 from app.service.memory_gate_service import memory_gate_service
-from app.service.subjectivity_service import subjectivity_service
+from app.service.subjectivity_service import describe_state, render_situation, subjectivity_service
 from app.service.persona_manager import persona_manager
 from app.service.agent_life_event_service import agent_life_event_service
 from app.service.prefrontal_lobe_memory import prefrontal_lobe_memory, format_records
@@ -233,6 +233,42 @@ def _episodic_cue(episodic: List[Dict[str, Any]]) -> float:
     return max((m.get("rerank_score", 0.0) for m in episodic), default=0.0)
 
 
+def _recalls_past(emotion: Dict[str, Any]) -> bool:
+    """
+    对方是不是在说过去的事（提起往事、之前的约定、问"你还记得吗"）。
+    用 System1 已有的三个判断，任一成立即可：意图、场景、needs_memory。单个判断都不稳定，合起来覆盖更全
+    """
+    return (emotion.get("user_intent") == "提起往事"
+            or emotion.get("situation") == "提及共同经历"
+            or emotion.get("needs_memory", 0.0) >= settings.BRAIN_ROUTE_MEMORY_THRESHOLD)
+
+
+def _format_recall(emotion: Dict[str, Any], episodic: List[Dict[str, Any]], limit: int,
+                   as_candidates: bool = False) -> str:
+    """
+    想起的往事，以及"我记得的边界"。直觉计划和 System2 共用。
+
+    只陈述事实：想起了什么、哪些想不起来。想不起来时直说、含糊带过还是反问，由人格决定，与知识缺口的处理一致。
+    - 边界说明（"没写到的部分我不知道"）不依赖"对方是不是在说往事"的判断：只要有往事，它都成立
+    - 对方在说往事时，召回只是按相似度排的候选，不一定有对方说的那件，要写明，否则模型会把不相干的往事当答案
+    - as_candidates：不管是否判为在说往事，都按"候选"呈现（给 System2 用：System1 常把"你觉得我上次给你的稿子
+      怎么样"判成征求意见，识别不出是在说往事，而这句说明对任何一句话都成立）
+    """
+    memories = _format_memories(episodic[:limit], "")
+    past = _recalls_past(emotion)
+    if not memories:
+        return "对方说的是过去的事，但我想不起和这件事有关的具体经历。" if past else ""
+    if past:
+        head = "对方说的是过去的事。我能想起的往事（按相关程度排列，不一定有对方说的那件）："
+    elif as_candidates:
+        head = "我想起的往事（按相关程度排列，只是候选，不一定和这句话有关）："
+    else:
+        head = "我想起的相关往事："
+    tail = ("这就是我记得的全部：对方提到的过去的事不在里面，就是我想不起来；在里面的，没写到的部分我也不知道。"
+            if past or as_candidates else "这就是我记得的全部，没写到的部分我不知道。")
+    return f"{head}\n{memories}\n{tail}"
+
+
 def _choose_route(
     emotion: Dict[str, Any], requires_knowledge: bool, speaker_known: bool = False, episodic_cue: float = 0.0,
 ) -> Tuple[str, str]:
@@ -247,6 +283,7 @@ def _choose_route(
     - 要不要带回忆，看两样，满足一样即可：System1 的 needs_memory，以及并行召回的情景记忆是否和这句话高度相关。
       needs_memory 是小模型的一次二选一判断，同一句话两次能在 0.05 和 0.99 之间跳；
       而往事往往是被对方的话勾起来的，召回到了高度相关的记忆，就该想起来（与知识"rerank 后还剩没剩"同理）
+    - 对方在说过去的事、却没有想起明确相关的往事（recall_uncertain）：交给 System2，见下方说明
     """
     if emotion.get("needs_reasoning", 1.0) >= settings.BRAIN_ROUTE_REASONING_THRESHOLD:
         return ROUTE_DELIBERATE, "needs_reasoning"
@@ -257,6 +294,11 @@ def _choose_route(
         return ROUTE_DELIBERATE, "hostile_to_known"
     if emotion.get("action_confidence", 0.0) < settings.BRAIN_ROUTE_MIN_ACTION_CONFIDENCE:
         return ROUTE_DELIBERATE, "low_action_confidence"
+    if _recalls_past(emotion) and episodic_cue < settings.BRAIN_EPISODIC_CUE_MIN_SCORE:
+        # 对方在说过去的事，但没有想起明确相关的往事：被问到想不起来的事，人会停一下想想，而不是凭直觉接话。
+        # 实测把"想不起来"写进直觉计划不管用：System3（角色模型）照样补出"绿萝还活着""钢笔是凌美的"；
+        # System2 会把"想不起来时怎么回"（直说、含糊、反问，按人格）明确写进决策，System3 只负责说出来
+        return ROUTE_DELIBERATE, "recall_uncertain"
     if requires_knowledge:
         return ROUTE_MEMORY, "knowledge"
     if emotion.get("needs_memory", 0.0) >= settings.BRAIN_ROUTE_MEMORY_THRESHOLD:
@@ -266,11 +308,50 @@ def _choose_route(
     return ROUTE_FAST, "intuitive"
 
 
+# System1 的 16 种情绪对整体状态的影响：(心情系数, 压力系数, 唤醒度)，乘以情绪强度得到增量。
+# 以前只处理了 9 种（还写了 System1 不会输出的"高兴""放松"），信任、悲伤、无聊等 7 种不改变任何状态：
+# 主要被判成"信任"的 Jarvis 状态从不变化，主要被判成"焦虑"的林诗雨一路累积到边界。
+# 按效价（正/负）和唤醒度（高/低）分组：
+# - 正面高唤醒：心情升、压力略降；正面低唤醒：心情小升、压力降得多（放松下来）
+# - 负面高唤醒：心情降、压力升；负面低唤醒：心情降、压力小升或不变（悲伤消沉不等于紧张）
+# 唤醒度只影响精力消耗：情绪越激动越累
+EMOTION_STATE_EFFECT: Dict[str, Tuple[float, float, float]] = {
+    # 正面 · 高唤醒
+    "兴奋": (0.30, -0.05, 1.0),
+    "喜悦": (0.30, -0.10, 1.0),
+    "惊喜": (0.25, -0.05, 1.0),
+    "自豪": (0.25, -0.10, 1.0),
+    # 正面 · 低唤醒
+    "平静": (0.05, -0.15, 0.0),
+    "满足": (0.20, -0.15, 0.0),
+    "信任": (0.10, -0.10, 0.0),
+    "感激": (0.20, -0.10, 0.0),
+    # 负面 · 高唤醒
+    "愤怒": (-0.30, 0.20, 1.0),
+    "焦虑": (-0.20, 0.20, 1.0),
+    "恐惧": (-0.30, 0.25, 1.0),
+    "沮丧": (-0.30, 0.15, 1.0),
+    # 负面 · 低唤醒
+    "悲伤": (-0.30, 0.05, 0.0),
+    "无聊": (-0.10, 0.00, 0.0),
+    "厌恶": (-0.20, 0.10, 0.0),
+    "困惑": (-0.05, 0.05, 0.0),
+}
+
+
+# "说"和"做"的时序事实：一轮 react 里，回复先生成并返回；对方托付的事（建待办、提醒、联系、查资料）
+# 在回复之后才在后台判断和执行，而且可能不执行（漏斗判为不需要、锁忙、模型失败）。
+# 所以说话的那一刻，对方让我做的事一件都还没做——只能说答应、打算，不能说已经做了。
+# 以前只写"计划里没写明已完成的不能说已完成"，模型会把"设置提醒""记下来"这类答应了就去做的事当成说完即完成
+THIS_TURN_FACT = "事实：这一轮我除了说话，还没有做任何事；对方刚才让我做的事，现在都还没做，之后才会去做。"
+
+
 def _quick_plan(
     emotion: Dict[str, Any],
     episodic: Optional[List[Dict[str, Any]]] = None,
     knowledge: Optional[List[Dict[str, Any]]] = None,
     knowledge_gap: bool = False,
+    situation: str = "",
 ) -> str:
     """
     fast/memory路径的行为计划：直接来自System1的直觉行为。
@@ -280,19 +361,23 @@ def _quick_plan(
     action = emotion.get("quick_action", "随口接话")
     lines = [f"对方是在：{emotion.get('user_intent', '其他')}",
              f"我的第一反应：{action}（{QUICK_ACTIONS.get(action, '')}）"]
-    if episodic:
-        lines.append("对方说的这件事，我记得的是（回应要落在这些具体的事上；这里没有的细节就是记不清了）：\n"
-                     + _format_memories(episodic[:3], ""))
+    recall = _format_recall(emotion, episodic or [], 3)
+    if recall:
+        lines.append(recall)
+    if situation:
+        # 只陈述事实，不要求提起。实测带上全部处境，问到时 12/12 答对，闲聊 0/20 硬塞（偶尔顺口关心一句是自然的）
+        lines.append(f"我近期的处境（对方问到时照此回答，没问到的不必提）：\n{situation}")
     if knowledge:
         lines.append("我对这个话题的了解（用自己的话自然带出，不要背书；可信度不高的内容只能说成'有资料称'，不能说成结论）：\n"
                      + _format_knowledge(knowledge, ""))
     if knowledge_gap:
         # 只陈述事实。不知道时怎么应对（直说、凭印象说、岔开话题）是元认知，已由 System1 按人格选进了"第一反应"
         lines.append("我手上的资料里没有直接讲这个的内容。")
-    elif not episodic and not knowledge:
+    elif not recall and not knowledge:
         lines.append("凭直觉回应，根据行为提示、对话上下文、我和对方的关系，给出符合我性格的自然回答。")
     # fast/memory 路径没有 System2 的事实检查，只能在这里约束：别把"可以帮你做"说成"已经做了"
-    lines.append("只能说已经知道的事。没有真正做过的事（联系了谁、发了什么、安排好了什么）不能说成已经做了；"
+    lines.append(THIS_TURN_FACT)
+    lines.append("只能说已经知道的事。过去发生过什么，只能用上面想起的往事，这里没写的就是想不起来；没有真正做过的事（联系了谁、发了什么、安排好了什么）不能说成已经做了，"
                  "可以说打算去做，或者问对方要不要做。")
     if emotion.get("user_intent") == "提问" and action not in ("岔开话题", "简单回答", "凭印象说"):
         # 不经过 System2 时，System1 的"反问对方"会让 System3 只抛回一句"你觉得呢？"而不回答。
@@ -346,6 +431,8 @@ def _format_decision(decision: Dict[str, Any]) -> str:
         lines.append(f"要说的假话：{'；'.join(decision['lies'])}")
     if decision.get("source"):
         lines.append(f"事实来源：{decision['source']}")
+    # 和直觉计划一样带上时序事实：System2 决定"我来办"，System3 仍会说成"已告知"，因为它不知道这一轮什么都还没做
+    lines.append(THIS_TURN_FACT)
     return "\n".join(lines)
 
 
@@ -520,6 +607,9 @@ class CyberBrain:
         # brief 与知识预取并行，都完成后再跑 System1：System1 要看到"我对这个话题掌握什么"，
         # 才能按人格给出不知道时的第一反应（直说、凭印象说、岔开话题……），这是元认知，不由系统统一规定
         brief, knowledge_prefetched = await asyncio.gather(_brief(), _knowledge_prefetch())
+        # 处境是近期一直挂在心上的几件事（每类最多 3 条），fast/memory 路径的计划整段带上：
+        # 说话的 System3 拿不到处境，被问到"证书哪天到期"时只能编
+        situation_text = render_situation(subject_context.situation if subject_context else None)
 
         # 是否使用知识只看 rerank 后还剩没剩：剩下的都是确实回答了这句话的条目
         knowledge = knowledge_prefetched[:settings.BRAIN_KNOWLEDGE_INJECT_TOP_K]
@@ -527,7 +617,8 @@ class CyberBrain:
 
         t0 = time.perf_counter()
         emotion = await self._system1(
-            agent_id, brief, signal, speaker_info, state_and_situation, recent_dialogue, _knowledge_hint(knowledge)
+            agent_id, brief, signal, speaker_info, state_and_situation, recent_dialogue, _knowledge_hint(knowledge),
+            state_words=describe_state(subject_context.overall_state if subject_context else None),
         )
         timings["system1"] = (time.perf_counter() - t0) * 1000
         # System1 认为需要知识、但资料里没有：只作为事实告诉 System3，怎么应对由直觉行为（人格）决定
@@ -548,9 +639,9 @@ class CyberBrain:
         if route == ROUTE_FAST:
             # 召回了但不相关到"被勾起"的程度，fast 路径不带
             episodic = []
-            plan = _quick_plan(emotion, knowledge_gap=knowledge_gap)
+            plan = _quick_plan(emotion, knowledge_gap=knowledge_gap, situation=situation_text)
         elif route == ROUTE_MEMORY:
-            plan = _quick_plan(emotion, episodic, knowledge, knowledge_gap)
+            plan = _quick_plan(emotion, episodic, knowledge, knowledge_gap, situation=situation_text)
         else:
             t0 = time.perf_counter()
             logger.info(f"[WorkingMemoryDebug] agent={agent_id}, working_memory length={len(working_memory)}, content={working_memory[:200]}")
@@ -559,7 +650,8 @@ class CyberBrain:
             )
             timings["system2"] = (time.perf_counter() - t0) * 1000
             # System2失败时退化为直觉计划，保证总能说出话
-            plan = _format_decision(decision) if decision else _quick_plan(emotion, episodic, knowledge, knowledge_gap)
+            plan = (_format_decision(decision) if decision
+                    else _quick_plan(emotion, episodic, knowledge, knowledge_gap, situation=situation_text))
 
         silent = bool(decision and decision.get("silent"))
         if silent:
@@ -607,7 +699,8 @@ class CyberBrain:
 
         # 评估并持久化重要记忆：只影响以后的召回（本轮已回答完，下一轮靠 PFC 里的原文），放后台，不阻塞本轮返回。
         # "先重激活、再写入"的顺序在 evaluate_and_persist 内部保证
-        self._spawn(memory_gate_service.evaluate_and_persist(agent_id, signal, speaker or "user", signal_record_id))
+        self._spawn(memory_gate_service.evaluate_and_persist(
+            agent_id, signal, speaker or "user", signal_record_id, recent_dialogue=recent_dialogue))
         # 当时的情绪也作为标签记下（"编码时的情绪"），整理经历时用来判断这件事对我的分量
         self._spawn(prefrontal_lobe_memory.tag(agent_id, signal_record_id, {
             "emotion": emotion.get("emotion"), "intensity": round(float(emotion.get("intensity", 0.0)), 2),
@@ -677,6 +770,7 @@ class CyberBrain:
         situation_context: str = "",
         recent_dialogue: str = "",
         knowledge_hint: str = "",
+        state_words: str = "",
     ) -> Dict[str, Any]:
         """
         潜意识情绪反应：使用tev1快速分析情绪、冲动、投入意愿和认知门控
@@ -694,7 +788,8 @@ class CyberBrain:
 
             # 调用 System One API（传入 situation_context）
             emotion = await system1_tev1.analyze(
-                brief_text, signal, persona_text, speaker_info, situation_context, recent_dialogue, knowledge_hint
+                brief_text, signal, persona_text, speaker_info, situation_context, recent_dialogue, knowledge_hint,
+                state_words=state_words,
             )
 
             return emotion
@@ -839,7 +934,10 @@ class CyberBrain:
         impulse_display = emotion.get('impulse', '无')
 
         brief_formatted = _format_memories(brief, "（暂无）")
-        episodic_formatted = _format_memories(episodic, "（没有想起相关的经历）")
+        # System2 一律按"召回只是候选"呈现：System1 常把"你觉得我上次给你的稿子怎么样"这类话判成征求意见、普通提问，
+        # 识别不出是在说往事；而"不一定有对方说的那件、不在里面就是没有记忆"对任何一句话都成立
+        episodic_formatted = (_format_recall(emotion, episodic, len(episodic), as_candidates=True)
+                              if episodic else "（没有想起相关的经历）")
 
         # Debug: 打印召回的记忆内容（帮助排查事实来源问题）
         logger.info(f"[System2 Input Debug] agent={agent_id}, brief count={len(brief)}, episodic count={len(episodic)}")
@@ -854,7 +952,7 @@ class CyberBrain:
             knowledge=_format_knowledge(knowledge, "（无相关知识）"),
             working_memory=working_memory or "（无）",
             signal=signal,
-        )
+        ) + f"\n\n{THIS_TURN_FACT}"
 
         messages = [
             {"role": "system", "content": SYSTEM2_PROMPT.format(
@@ -965,25 +1063,24 @@ class CyberBrain:
             emotion_name = emotion.get("emotion", "平静")
             intensity = emotion.get("intensity", 0.0)
 
-            # 情绪映射到 mood 和 stress 变化
-            mood_delta = 0.0
-            stress_delta = 0.0
+            # 情绪映射到心情、压力的变化（System1 的 16 种情绪全部覆盖，见 EMOTION_STATE_EFFECT）；
+            # 每轮对话都消耗一点精力，情绪越激动（高唤醒）消耗越多
+            mood_coef, stress_coef, arousal = EMOTION_STATE_EFFECT.get(emotion_name, (0.0, 0.0, 0.0))
+            mood_delta = mood_coef * intensity
+            stress_delta = stress_coef * intensity
+            energy_delta = -settings.ENERGY_COST_PER_TURN * (1 + arousal * intensity)
 
-            if emotion_name in ["喜悦", "高兴", "兴奋", "感激"]:
-                mood_delta = intensity * 0.3  # 正面情绪提升 mood
-                stress_delta = -intensity * 0.1  # 降低 stress
-            elif emotion_name in ["焦虑", "愤怒", "沮丧", "恐惧"]:
-                mood_delta = -intensity * 0.3  # 负面情绪降低 mood
-                stress_delta = intensity * 0.2  # 提升 stress
-            elif emotion_name in ["平静", "放松"]:
-                stress_delta = -intensity * 0.15  # 平静降低 stress
-
-            if abs(mood_delta) > 0.01 or abs(stress_delta) > 0.01:
+            if abs(mood_delta) <= 0.01 and abs(stress_delta) <= 0.01:
+                # 情绪几乎没波动：只扣精力，不记情绪事件
+                await subjectivity_service.adjust_overall_state(
+                    agent_id=agent_id, energy_delta=energy_delta, reason="对话消耗精力")
+            else:
                 reason = f"对话情绪: {emotion_name} (强度: {intensity:.2f})"
                 change = await subjectivity_service.adjust_overall_state(
                     agent_id=agent_id,
                     mood_delta=mood_delta,
                     stress_delta=stress_delta,
+                    energy_delta=energy_delta,
                     reason=reason
                 )
                 logger.info(f"Updated overall_state for {agent_id}: mood_delta={mood_delta:.3f}, stress_delta={stress_delta:.3f}")

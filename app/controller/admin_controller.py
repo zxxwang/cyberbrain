@@ -98,8 +98,8 @@ class SituationInit(BaseModel):
 
 
 class OverallStateInit(BaseModel):
-    """整体状态初始化"""
-    mood: float = Field(default=0.5, ge=0.0, le=1.0, description="心情 0-1")
+    """整体状态初始化。同时作为基线：情绪波动后会随时间回到这里"""
+    mood: float = Field(default=0.0, ge=-1.0, le=1.0, description="心情 -1（最差）~ 1（最好），0 为平常")
     stress: float = Field(default=0.3, ge=0.0, le=1.0, description="压力 0-1")
     energy: float = Field(default=0.7, ge=0.0, le=1.0, description="精力 0-1")
 
@@ -514,7 +514,7 @@ async def get_agent_info(agent_id: str):
     - capabilities: ["web_search", ...]（未开启时为空列表）
     - relationships: [{person_name, relationship, description, kind, agent_id}]
     - situation: {current_activity, time_sensitive_events, ongoing_states, attention_focus}
-    - overall_state: {mood, stress, energy}
+    - overall_state: {mood, stress, energy}（按时间结算后的当前值）；overall_state_baseline: 基线
     - thoughts: [{content, trigger, intensity}]
     - pending_tasks: [{content, source, priority, deadline, related_person, interaction_type, status}]
     - brief_memories: [{content, tags, metadata}]
@@ -580,11 +580,13 @@ async def get_agent_info(agent_id: str):
 
                 # Overall State
                 if context.overall_state:
+                    # 返回的是按时间结算后的当前值（get_context 已结算）
                     result["overall_state"] = {
-                        "mood": context.overall_state.get("mood", 0.5),
+                        "mood": context.overall_state.get("mood", 0.0),
                         "stress": context.overall_state.get("stress", 0.3),
                         "energy": context.overall_state.get("energy", 0.7)
                     }
+                    result["overall_state_baseline"] = dict(context.baseline)
 
                 # Thoughts
                 if context.thoughts:
@@ -747,11 +749,15 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                 updated_fields.append("situation")
 
             if request.overall_state is not None:
-                context.overall_state = {
+                state = {
                     "mood": request.overall_state.mood,
                     "stress": request.overall_state.stress,
                     "energy": request.overall_state.energy
                 }
+                # 人工设定的是"这个人平时的状态"：同时作为基线，并从现在开始计时
+                context.overall_state = dict(state)
+                context.baseline = dict(state)
+                context.state_updated_at = datetime.now().isoformat()
                 updated_fields.append("overall_state")
 
             if request.thoughts is not None:
@@ -780,7 +786,9 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
 
         # 4. 更新Relationships（覆盖式：先清空再添加）
         if request.relationships is not None:
-            # 清空现有关系
+            # 覆盖关系，但保留仍在列表里的人从对话中积累的个人信息（profile 不由接口维护，清空就丢了）
+            old_profiles = {name: rec.get("profile") or {}
+                            for name, rec in (await relationship_repository.load_all(agent_id)).items()}
             await relationship_repository.clear_all_relationships(agent_id)
 
             # 添加新关系
@@ -792,6 +800,7 @@ async def update_agent(agent_id: str, request: UpdateAgentRequest):
                     description=rel.description,
                     kind=rel.kind,
                     target_agent_id=rel.agent_id,
+                    profile=old_profiles.get(rel.person_name, {}),
                 )
 
             updated_fields.append("relationships")
