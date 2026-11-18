@@ -10,6 +10,7 @@ Memory Gate Service: 记忆价值评估服务
 不写 Episodic / Brief：经历由工作记忆整理时提取（episode_consolidation_service），信念只由反思写入
 """
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -317,6 +318,7 @@ class MemoryGateService:
         signal: str,
         speaker: str,
         record_id: Optional[str] = None,
+        recent_dialogue: str = "",
     ) -> None:
         """
         对方这句话的实时处理（后台执行，不阻塞 react 返回）。
@@ -330,6 +332,7 @@ class MemoryGateService:
 
         Args:
             record_id: 这句话在工作记忆里的记录 id，用于打标签
+            recent_dialogue: 这句话之前的几句原文（更新处境时理解省略回答，如"批了，月底最后一天上班"）
         """
         try:
             messages = [{"role": "user", "content": signal}]
@@ -355,7 +358,8 @@ class MemoryGateService:
 
             # 处境与状态：只有重要的信息才值得改变处境
             if importance >= 3:
-                await self._update_situation_and_state(agent_id, signal, importance, memory_type)
+                await self._update_situation_and_state(agent_id, signal, importance, memory_type,
+                                                       speaker=speaker, recent_dialogue=recent_dialogue)
 
         except Exception as e:
             logger.error(f"Failed to evaluate memory gate: {e}", exc_info=True)
@@ -365,7 +369,9 @@ class MemoryGateService:
         agent_id: str,
         signal: str,
         importance: int,
-        memory_type: str
+        memory_type: str,
+        speaker: Optional[str] = None,
+        recent_dialogue: str = "",
     ):
         """
         基于重要信息更新 Situation 和 Overall State
@@ -395,14 +401,17 @@ class MemoryGateService:
 
             # 使用 LLM 判断这条信号是否需要更新 situation
             update_decision = await doubao_client.decide(
-                state=f"当前状态：{current_situation}\n\n新信息：{signal}",
+                state=(f"当前处境：{current_situation}\n\n" + (f"刚才的对话：\n{recent_dialogue}\n\n" if recent_dialogue else "")
+                       + f"新信息（{speaker or '对方'}说）：{signal}"),
                 questions={
                     "should_update": {
                         "type": "choice",
                         "instructions": "这条新信息是否需要更新当前状态？",
                         "criteria": {
-                            "yes": "包含明确的新事件、新计划、状态变化、关注点变化",
-                            "no": "只是普通对话，不涉及状态变化"
+                            "yes": "我的处境有变化：有了新的、有确定日期的事（会议、截稿、见面），已有的事改了时间、"
+                                   "解决或取消了，我或我在意的人的持续状况变了，我心里挂着的事变了",
+                            "no": "普通对话；只是请我做某件事、我答应了做某件事（那是待办）；"
+                                  "只是讲了一件已经过去的事，不会持续影响我"
                         }
                     }
                 }
@@ -412,22 +421,21 @@ class MemoryGateService:
 
             if not should_update:
                 logger.debug(f"Skip situation update for signal: {signal[:30]}...")
-                # 即使不更新 situation，也可能需要调整 overall_state
-                await subjectivity_service.adjust_overall_state(
-                    agent_id,
-                    mood_delta=0.0,
-                    stress_delta=0.0,
-                    reason="no_update"
-                )
                 return
 
             # 如果需要更新，使用 LLM 生成新的 situation
             from app.config.prompts import SITUATION_UPDATE_PROMPT
             from app.service.prefrontal_lobe_memory import format_records
 
+            # 给今天的日期（相对时间才能换算准确）、说话人和刚才的几句（省略回答要靠上文）
+            now = datetime.now()
+            records = (recent_dialogue + "\n" if recent_dialogue else "") + format_records(
+                [{"type": "raw", "role": "user", "speaker": speaker or "对方", "content": signal}])
             prompt = SITUATION_UPDATE_PROMPT.format(
-                current_situation=str(current_situation),
-                records=format_records([{"type": "raw", "role": "user", "speaker": "user", "content": signal}])
+                today=now.strftime("%Y-%m-%d"),
+                weekday="星期" + "一二三四五六日"[now.weekday()],
+                current_situation=json.dumps(current_situation, ensure_ascii=False),
+                records=records,
             )
 
             response = (await doubao_client.generate(prompt, max_tokens=1000)).strip()
@@ -437,8 +445,14 @@ class MemoryGateService:
                 lines = response.split("\n")
                 response = "\n".join(lines[1:-1])
 
-            import json
-            updated_situation = json.loads(response)
+            # 模型偶尔在 JSON 前后带说明文字：只取第一个 { 到最后一个 }；仍然解析失败就放弃本次更新（不影响对话）
+            if "{" in response and "}" in response:
+                response = response[response.index("{"): response.rindex("}") + 1]
+            try:
+                updated_situation = json.loads(response)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Situation update skipped for {agent_id}: LLM returned invalid JSON ({e})")
+                return
 
             # 验证字段
             required_keys = {"current_activity", "time_sensitive_events", "ongoing_states", "attention_focus"}
@@ -454,7 +468,6 @@ class MemoryGateService:
             # 简单策略：有 deadline 临近的事件 → stress ↑
             stress_delta = 0.0
             if updated_situation.get("time_sensitive_events"):
-                from datetime import datetime, timedelta
                 today = datetime.now().date()
                 for event in updated_situation["time_sensitive_events"]:
                     deadline_str = event.get("deadline")
@@ -464,13 +477,12 @@ class MemoryGateService:
                         if 0 < days_left <= 3:
                             stress_delta += 0.1  # 3天内的事件，stress +0.1
 
-            change = await subjectivity_service.adjust_overall_state(
-                agent_id,
-                mood_delta=0.0,
-                stress_delta=stress_delta,
-                reason="situation_update"
-            )
             if stress_delta:
+                change = await subjectivity_service.adjust_overall_state(
+                    agent_id,
+                    stress_delta=stress_delta,
+                    reason="situation_update"
+                )
                 await agent_life_event_service.record_emotion(
                     agent_id=agent_id,
                     emotion_state={**change, "delta": {"mood": 0.0, "stress": round(stress_delta, 4)}},

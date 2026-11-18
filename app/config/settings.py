@@ -115,6 +115,11 @@ class Settings(BaseSettings):
     TODO_DEDUP_SIMILARITY: float = 0.6  # 去重粗筛：余弦≥此值的已有任务作为候选，再由 System One 判断是否同一件事
     TODO_DEDUP_WINDOW_HOURS: int = 24  # 完成/取消的任务在这段时间内仍参与去重
 
+    # 整体状态动力学：情绪随时间回到基线、精力随时间恢复（读取时按流逝时间结算，不需要定时任务）
+    STATE_REGRESSION_TAU_HOURS: float = 6.0  # 心情/压力回归基线的时间常数：6 小时回去约 63%，一天基本回到基线
+    ENERGY_RECOVERY_TAU_HOURS: float = 4.0  # 精力恢复的时间常数（压力越大恢复越慢：实际 τ × (1 + 压力)）
+    ENERGY_COST_PER_TURN: float = 0.02  # 每轮对话消耗的精力，情绪越激动消耗越多（最多翻倍）
+
     # Worker配置
     DECAY_WORKER_INTERVAL: int = 86400  # 24小时
     THOUGHT_GENERATOR_INTERVAL: int = 3600  # 念头生成间隔（秒），默认1小时

@@ -10,12 +10,13 @@ Subjectivity Service: 主体性服务
 import asyncio
 import json
 import logging
+import math
 import random
 import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -32,6 +33,51 @@ logger = logging.getLogger(__name__)
 # 数据结构
 # ============================================================================
 
+# 整体状态的取值范围：心情 -1（最差）~ 1（最好），压力、精力 0 ~ 1
+STATE_RANGE = {"mood": (-1.0, 1.0), "stress": (0.0, 1.0), "energy": (0.0, 1.0)}
+# 没有配置基线（旧数据）时用的中性基线
+DEFAULT_BASELINE = {"mood": 0.0, "stress": 0.3, "energy": 0.7}
+
+
+def format_state_lines(state: Dict[str, float], prefix: str = "") -> List[str]:
+    """整体状态 → 提示词里的三行，带刻度：心情的范围是 -1 ~ 1，不标出来模型分不清 0.2 是好是坏"""
+    return [
+        f"{prefix}心情：{state.get('mood', 0.0):.2f}（-1 最差，0 平常，1 最好）",
+        f"{prefix}压力：{state.get('stress', 0.3):.2f}（0 ~ 1，越高压力越大）",
+        f"{prefix}精力：{state.get('energy', 0.7):.2f}（0 ~ 1，越低越疲惫）",
+    ]
+
+
+def describe_state(state: Optional[Dict[str, float]]) -> str:
+    """
+    整体状态 → 一句话（"心情不太好，压力很大，有点累"）。给 System1 放在这句话旁边用：
+    小模型对数字不敏感、对紧挨着信号的文字敏感，三行数字放在上下文开头时它几乎不用（实测去掉状态，判断不变）
+    """
+    if not state:
+        return ""
+    mood, stress, energy = state.get("mood", 0.0), state.get("stress", 0.3), state.get("energy", 0.7)
+    m = ("心情很差" if mood <= -0.5 else "心情不太好" if mood <= -0.15 else "心情平常" if mood < 0.15
+         else "心情不错" if mood < 0.5 else "心情很好")
+    s = "压力很大" if stress >= 0.75 else "有些压力" if stress >= 0.5 else "没什么压力"
+    e = "非常疲惫" if energy <= 0.25 else "有点累" if energy <= 0.45 else "精力充沛" if energy >= 0.75 else "精力还行"
+    return f"{m}，{s}，{e}"
+
+
+def _clamp(key: str, value: float) -> float:
+    lo, hi = STATE_RANGE[key]
+    return max(lo, min(hi, float(value)))
+
+
+def _diminish(key: str, current: float, delta: float) -> float:
+    """
+    边际递减：增量乘以"离边界还剩多少"（占整个取值范围的比例）。
+    越接近边界越难再往前推，往回拉则几乎不受影响，所以连续同向刺激会饱和，不会几句话就贴边
+    """
+    lo, hi = STATE_RANGE[key]
+    room = (hi - current) if delta > 0 else (current - lo)
+    return delta * max(0.0, room) / (hi - lo)
+
+
 class SubjectContext:
     """主体性上下文：Agent的主观世界"""
 
@@ -42,7 +88,9 @@ class SubjectContext:
         thoughts: List[Dict] = None,
         overall_state: Dict = None,
         pending_tasks: List[Dict] = None,
-        recent_done: List[Dict] = None
+        recent_done: List[Dict] = None,
+        baseline: Dict = None,
+        state_updated_at: Optional[str] = None,
     ):
         self.agent_id = agent_id
         self.situation = situation or {}
@@ -55,6 +103,11 @@ class SubjectContext:
         self.pending_tasks = pending_tasks or []
         # 近期完成/取消的任务（只留去重需要的字段：内容、向量、完成时间），完成的任务本身已从 pending_tasks 移除
         self.recent_done = recent_done or []
+        # 整体状态的基线（这个人平时的状态）：情绪会随时间回到这里。由初始化/更新接口设定
+        self.baseline = baseline or dict(DEFAULT_BASELINE)
+        # 整体状态最后一次按时间结算的时刻。和 last_update 分开：last_update 任何保存都会刷新（如加一条待办），
+        # 用它算"过了多久"会把回归计时错误地清零
+        self.state_updated_at = state_updated_at or datetime.now().isoformat()
         self.last_update = datetime.now().isoformat()
 
     def to_dict(self) -> Dict:
@@ -65,6 +118,8 @@ class SubjectContext:
             "overall_state": self.overall_state,
             "pending_tasks": self.pending_tasks,
             "recent_done": self.recent_done,
+            "baseline": self.baseline,
+            "state_updated_at": self.state_updated_at,
             "last_update": self.last_update
         }
 
@@ -76,13 +131,100 @@ class SubjectContext:
             thoughts=data.get("thoughts", []),
             overall_state=data.get("overall_state", {}),
             pending_tasks=data.get("pending_tasks", []),
-            recent_done=data.get("recent_done", [])
+            recent_done=data.get("recent_done", []),
+            baseline=data.get("baseline"),
+            # 旧数据没有这个字段：从读到的这一刻开始计时，不对过去补算
+            state_updated_at=data.get("state_updated_at"),
         )
 
 
 # ============================================================================
 # Service
 # ============================================================================
+
+# 每类处境最多展示几条：关注点和事件太多会撑大 prompt，也会稀释真正重要的那几件
+SITUATION_MAX_ITEMS = 3
+
+
+def _event_due(event: Dict[str, Any], today) -> Optional[tuple]:
+    """(deadline, 剩余天数)；无 deadline、格式错误或已过期返回 None"""
+    try:
+        deadline = datetime.strptime(str(event.get("deadline")), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+    days_left = (deadline - today).days
+    return (deadline, days_left) if days_left >= 0 else None
+
+
+def render_situation(situation: Optional[Dict[str, Any]]) -> str:
+    """
+    把客观处境渲染成 prompt 文本。System1/2（format_for_prompts）和念头生成（format_situation_for_prompt）共用，
+    以前两处各写一份，System1/2 那份漏了 attention_focus、也不过滤过期事件。
+
+    - 时间敏感事件：过期、无日期或日期格式错误的不展示；按截止日期由近到远取前 3 条，
+      每条标上"今天 / 明天 / 还有 N 天"——只给日期时，模型分不清这件事是过去还是将来
+    - 持续状态、当前关注：各最多 3 条
+    """
+    if not situation:
+        return ""
+    lines: List[str] = []
+    if situation.get("current_activity"):
+        lines.append(f"当前活动：{situation['current_activity']}")
+
+    today = datetime.now().date()
+    upcoming = []
+    for e in situation.get("time_sensitive_events") or []:
+        due = _event_due(e, today)
+        desc = e.get("description") or e.get("event")
+        if due and desc:
+            upcoming.append((due[0], due[1], desc))
+    upcoming.sort(key=lambda x: x[0])
+    if upcoming:
+        lines.append("时间敏感事件：")
+        for deadline, days_left, desc in upcoming[:SITUATION_MAX_ITEMS]:
+            when = "今天" if days_left == 0 else "明天" if days_left == 1 else f"还有{days_left}天"
+            lines.append(f"- {desc}（{deadline.strftime('%m月%d日')}，{when}）")
+
+    states = [s for s in situation.get("ongoing_states") or [] if s][:SITUATION_MAX_ITEMS]
+    if states:
+        lines.append(f"持续状态：{'、'.join(states)}")
+
+    focus = [f for f in situation.get("attention_focus") or [] if f][:SITUATION_MAX_ITEMS]
+    if focus:
+        lines.append(f"当前关注：{'、'.join(focus)}")
+    return "\n".join(lines)
+
+
+def settle_state(context: "SubjectContext", now: Optional[datetime] = None) -> None:
+    """
+    把"上次结算到现在"这段时间的变化补算进整体状态（就地修改，不保存）：
+    - 心情、压力：指数回归到基线，x += (基线 - x)·(1 - e^(-小时/τ))，τ = STATE_REGRESSION_TAU_HOURS
+    - 精力：向基线恢复，压力越大恢复越慢（τ 乘以 1 + 压力）
+
+    读取时补算，不需要定时任务：没人读的值不必实时更新，读的时候算出来就是对的。
+    结算后把 state_updated_at 改成 now：之后若保存，保存的就是结算后的值和对应时刻；不保存，下次从原时刻重算，
+    结果一样（指数回归分段算和一次算相同）
+    """
+    now = now or datetime.now()
+    try:
+        last = datetime.fromisoformat(context.state_updated_at)
+    except (TypeError, ValueError):
+        context.state_updated_at = now.isoformat()
+        return
+    hours = (now - last).total_seconds() / 3600
+    if hours <= 0:
+        return
+    state, base = context.overall_state, context.baseline
+    k = 1 - math.exp(-hours / settings.STATE_REGRESSION_TAU_HOURS)
+    for key in ("mood", "stress"):
+        cur = state.get(key, base.get(key, DEFAULT_BASELINE[key]))
+        state[key] = round(_clamp(key, cur + (base.get(key, DEFAULT_BASELINE[key]) - cur) * k), 4)
+    energy = state.get("energy", base.get("energy", DEFAULT_BASELINE["energy"]))
+    tau_e = settings.ENERGY_RECOVERY_TAU_HOURS * (1 + state.get("stress", 0.3))
+    k_e = 1 - math.exp(-hours / tau_e)
+    state["energy"] = round(_clamp("energy", energy + (base.get("energy", DEFAULT_BASELINE["energy"]) - energy) * k_e), 4)
+    context.state_updated_at = now.isoformat()
+
 
 class SubjectivityService:
     """主体性服务"""
@@ -104,10 +246,13 @@ class SubjectivityService:
             return None
 
         try:
-            return SubjectContext.from_dict(json.loads(data))
+            context = SubjectContext.from_dict(json.loads(data))
         except Exception as e:
             logger.error(f"Failed to parse subject context for {agent_id}: {e}")
             return None
+        # 读到的整体状态先按流逝的时间结算（情绪回落、精力恢复）
+        settle_state(context)
+        return context
 
     async def save_context(self, context: SubjectContext):
         """保存主体性上下文"""
@@ -133,26 +278,13 @@ class SubjectivityService:
         state_lines = []
         if context.overall_state:
             state_lines.append("## 整体状态")
-            state_lines.append(f"心情：{context.overall_state.get('mood', 0.0):.1f}")
-            state_lines.append(f"压力：{context.overall_state.get('stress', 0.3):.1f}")
-            state_lines.append(f"精力：{context.overall_state.get('energy', 0.7):.1f}")
+            state_lines.extend(format_state_lines(context.overall_state))
 
         state_only = "\n".join(state_lines) if state_lines else ""
 
-        # Situation（客观处境）
-        situation_lines = []
-        if context.situation:
-            situation_lines.append("\n## 客观处境")
-            if context.situation.get('current_activity'):
-                situation_lines.append(f"当前活动：{context.situation['current_activity']}")
-            if context.situation.get('time_sensitive_events'):
-                events = [f"- {e.get('description') or e.get('event')} ({e.get('deadline')})" for e in context.situation.get('time_sensitive_events', [])[:3]]
-                if events:
-                    situation_lines.append(f"时间敏感事件：\n" + "\n".join(events))
-            if context.situation.get('ongoing_states'):
-                situation_lines.append(f"持续状态：{', '.join(context.situation.get('ongoing_states', [])[:3])}")
-
-        situation_str = "\n".join(situation_lines) if situation_lines else ""
+        # Situation（客观处境）：与念头生成共用 render_situation，保证两边看到的处境一致
+        body = render_situation(context.situation)
+        situation_str = f"\n## 客观处境\n{body}" if body else ""
 
         state_and_situation = state_only + situation_str
 
@@ -276,45 +408,8 @@ class SubjectivityService:
             logger.info(f"Cleaned {len(events) - len(valid_events)} expired events for {agent_id}")
 
     async def format_situation_for_prompt(self, agent_id: str) -> str:
-        """格式化situation用于prompt"""
-        situation = await self.get_situation(agent_id)
-        if not situation:
-            return ""
-
-        lines = []
-
-        if situation.get("current_activity"):
-            lines.append(f"- {situation['current_activity']}")
-
-        if situation.get("time_sensitive_events"):
-            today = datetime.now().date()
-            for event in situation["time_sensitive_events"]:
-                # 过期、无deadline或格式错误的事件不展示
-                try:
-                    deadline = datetime.strptime(event["deadline"], "%Y-%m-%d").date()
-                except (KeyError, TypeError, ValueError):
-                    continue
-                days_left = (deadline - today).days
-                if days_left < 0:
-                    continue
-
-                if days_left == 0:
-                    time_str = "今天"
-                elif days_left == 1:
-                    time_str = "明天"
-                else:
-                    time_str = f"还有{days_left}天"
-
-                lines.append(f"- {event['description']}（{deadline.strftime('%m月%d日')}，{time_str}）")
-
-        if situation.get("ongoing_states"):
-            for state in situation["ongoing_states"]:
-                lines.append(f"- {state}")
-
-        if situation.get("attention_focus"):
-            lines.append(f"- 当前关注：{', '.join(situation['attention_focus'])}")
-
-        return "\n".join(lines) if lines else ""
+        """格式化situation用于念头生成等 prompt（与 System1/2 使用同一个 render_situation）"""
+        return render_situation(await self.get_situation(agent_id))
 
     # ------------------------------------------------------------------------
     # Narrative（个人叙事）
@@ -459,6 +554,7 @@ class SubjectivityService:
         from app.repository.relationship_repository import relationship_repository
         people = await relationship_repository.load_all(agent_id)
         people_str = "、".join(f"{n}（{r['relationship']}）" for n, r in people.items()) or "（无）"
+        state_block = "\n".join(format_state_lines(context.overall_state, prefix="                    - "))
         prompt = f"""你是这个Agent的内心世界。
 
                     现在是 {now.strftime('%Y年%m月%d日 %H:%M')}。
@@ -467,9 +563,7 @@ class SubjectivityService:
                     {situation_str}
 
                     【整体状态】
-                    - 心情：{context.overall_state.get('mood', 0.0):.2f}
-                    - 压力：{context.overall_state.get('stress', 0.3):.2f}
-                    - 精力：{context.overall_state.get('energy', 0.7):.2f}
+{state_block}
 
                     【我认识的人】{people_str}
 
@@ -495,8 +589,14 @@ class SubjectivityService:
                 lines = response.split("\n")
                 response = "\n".join(lines[1:-1])
 
-            thought_data = json.loads(response)
-            return thought_data
+            # 模型偶尔在 JSON 前后带说明文字：只取第一个 { 到最后一个 }；仍然解析失败就放弃这次念头（不影响对话）
+            if "{" in response and "}" in response:
+                response = response[response.index("{"): response.rindex("}") + 1]
+            try:
+                return json.loads(response)
+            except json.JSONDecodeError as e:
+                logger.warning(f"Thought skipped for {agent_id}: LLM returned invalid JSON ({e})")
+                return None
         except Exception as e:
             logger.error(f"Failed to generate thought: {e}", exc_info=True)
             return None
@@ -510,73 +610,59 @@ class SubjectivityService:
         agent_id: str,
         mood: float,
         stress: float,
-        energy: float
+        energy: float,
+        set_baseline: bool = True,
     ):
         """
-        直接设置overall_state（用于初始化）
+        直接设置整体状态（初始化 / 管理接口）。默认同时设为基线：初始化和人工设定的都是"这个人平时的状态"，
+        情绪波动之后会随时间回到这里
 
         Args:
-            agent_id: Agent ID
-            mood: 心情值 [0.0, 1.0]
-            stress: 压力值 [0.0, 1.0]
-            energy: 精力值 [0.0, 1.0]
+            mood: 心情 [-1, 1]；stress、energy: [0, 1]
         """
         context = await self.get_context(agent_id)
         if not context:
             context = SubjectContext(agent_id=agent_id)
-
-        context.overall_state["mood"] = max(0.0, min(1.0, mood))
-        context.overall_state["stress"] = max(0.0, min(1.0, stress))
-        context.overall_state["energy"] = max(0.0, min(1.0, energy))
-
+        state = {"mood": _clamp("mood", mood), "stress": _clamp("stress", stress), "energy": _clamp("energy", energy)}
+        context.overall_state = dict(state)
+        if set_baseline:
+            context.baseline = dict(state)
+        context.state_updated_at = datetime.now().isoformat()
         await self.save_context(context)
-        logger.info(f"Set overall_state for {agent_id}: mood={mood:.2f}, stress={stress:.2f}, energy={energy:.2f}")
+        logger.info(f"Set overall_state for {agent_id}: {state} (baseline={'yes' if set_baseline else 'no'})")
 
     async def adjust_overall_state(
         self,
         agent_id: str,
         mood_delta: float = 0.0,
         stress_delta: float = 0.0,
+        energy_delta: float = 0.0,
         reason: str = ""
     ):
         """
-        调整overall_state（由Memory Gate调用）
+        按增量调整整体状态（对话情绪、处境变化）。
 
-        Args:
-            agent_id: Agent ID
-            mood_delta: 心情变化 [-1.0, 1.0]
-            stress_delta: 压力变化 [-1.0, 1.0]
-            reason: 调整原因
+        - 先按流逝的时间结算（get_context 已做），再加增量
+        - 增量做边际递减：越接近边界越难再推（见 _diminish）
+        - 精力独立变化：只由 energy_delta（对话消耗）和时间恢复决定，不再由压力换算
 
         Returns:
-            {"before": 调整前的 overall_state, "after": 调整后的 overall_state}
+            {"before": 调整前（已按时间结算）, "after": 调整后}
         """
         context = await self.get_context(agent_id)
         if not context:
             context = SubjectContext(agent_id=agent_id)
-        before = dict(context.overall_state)
-
-        # 调整心情
-        current_mood = context.overall_state.get("mood", 0.0)
-        new_mood = max(-1.0, min(1.0, current_mood + mood_delta))
-        context.overall_state["mood"] = new_mood
-
-        # 调整压力
-        current_stress = context.overall_state.get("stress", 0.3)
-        new_stress = max(0.0, min(1.0, current_stress + stress_delta))
-        context.overall_state["stress"] = new_stress
-
-        # 重新计算精力
-        context.overall_state["energy"] = max(0.1, 1.0 - new_stress * 0.7)
-
+        state = context.overall_state
+        before = dict(state)
+        for key, delta in (("mood", mood_delta), ("stress", stress_delta), ("energy", energy_delta)):
+            if not delta:
+                continue
+            cur = state.get(key, context.baseline.get(key, DEFAULT_BASELINE[key]))
+            state[key] = round(_clamp(key, cur + _diminish(key, cur, delta)), 4)
+        context.state_updated_at = datetime.now().isoformat()
         await self.save_context(context)
-        logger.info(
-            f"Adjusted overall_state for {agent_id}: "
-            f"mood {current_mood:.2f} -> {new_mood:.2f}, "
-            f"stress {current_stress:.2f} -> {new_stress:.2f} "
-            f"({reason})"
-        )
-        return {"before": before, "after": dict(context.overall_state)}
+        logger.info(f"Adjusted overall_state for {agent_id}: {before} -> {dict(state)} ({reason})")
+        return {"before": before, "after": dict(state)}
 
     # ------------------------------------------------------------------------
     # 用于Prompt的格式化
@@ -598,9 +684,7 @@ class SubjectivityService:
         # 整体状态
         state = context.overall_state
         lines.append("【当前整体状态】")
-        lines.append(f"- 心情：{state.get('mood', 0.0):.2f}")
-        lines.append(f"- 压力：{state.get('stress', 0.3):.2f}")
-        lines.append(f"- 精力：{state.get('energy', 0.7):.2f}")
+        lines.extend(format_state_lines(state, prefix="- "))
         lines.append("")
 
         # 客观处境

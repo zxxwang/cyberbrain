@@ -99,9 +99,8 @@ class TaskExecutor:
 
             # 不再把模拟结果写入 Knowledge：模拟执行是 LLM 编的一句话，不是真实获取的知识，
             # 写进去会污染知识库。需要获取知识的任务由 needs_web_search 走真实的联网搜索
-
-            # 4. 检查是否影响 Situation
-            await self._update_situation_if_needed(agent_id, task, result)
+            # 同理也不写处境：以前会把"已与某某完成深谈"这类编出来的完成结果追加进持续状态，
+            # 处境里堆满已经结束、甚至没发生过的事。处境只由对话（Memory Gate）和接口维护
 
             logger.info(f"Task executed for {agent_id}: {task['content']} → {result}")
 
@@ -311,80 +310,6 @@ class TaskExecutor:
 
         result = await doubao_client.generate(prompt, max_tokens=100)
         return result.strip()
-
-    async def _update_situation_if_needed(self, agent_id: str, task: Dict, result: str):
-        """判断任务完成是否影响 Situation"""
-        try:
-            # 使用 LLM 判断是否需要更新 situation
-            decision = await self._should_update_situation(task, result)
-
-            if not decision["should_update"]:
-                return
-
-            # 更新 situation
-            situation = await subjectivity_service.get_situation(agent_id)
-            if not situation:
-                situation = {}
-
-            # 根据任务类型更新
-            if decision["update_type"] == "current_activity":
-                situation["current_activity"] = decision["new_value"]
-            elif decision["update_type"] == "time_sensitive_event_done":
-                # 标记事件完成
-                events = situation.get("time_sensitive_events", [])
-                for event in events:
-                    if event.get("description") in task["content"]:
-                        event["status"] = "completed"
-                situation["time_sensitive_events"] = events
-            elif decision["update_type"] == "ongoing_state":
-                # 更新持续状态
-                states = situation.get("ongoing_states", [])
-                states.append(decision["new_value"])
-                situation["ongoing_states"] = states[-5:]  # 只保留最近5个
-
-            await subjectivity_service.replace_situation(agent_id, situation)
-            logger.info(f"Updated situation: {decision['update_type']} = {decision.get('new_value', '')}")
-
-        except Exception as e:
-            logger.error(f"Failed to update situation: {e}", exc_info=True)
-
-    async def _should_update_situation(self, task: Dict, result: str) -> Dict:
-        """LLM 判断是否需要更新 situation"""
-        prompt = f"""判断任务完成是否影响 Agent 的处境。
-
-                任务：{task['content']}
-                结果：{result}
-                
-                判断：
-                1. 是否需要更新处境？
-                2. 更新什么？
-                   - current_activity: 当前主要活动（如"正在开发游戏"）
-                   - time_sensitive_event_done: 时间敏感事件完成
-                   - ongoing_state: 持续状态（如"刚学会了新技能"）
-                
-                输出JSON：
-                {{
-                  "should_update": true/false,
-                  "update_type": "current_activity" | "time_sensitive_event_done" | "ongoing_state" | null,
-                  "new_value": "新状态描述" | null
-                }}
-                
-                示例：
-                - "学习 Redis" → {{"should_update": true, "update_type": "ongoing_state", "new_value": "刚学习了 Redis"}}
-                - "给张三发邮件" → {{"should_update": false}}
-                - "准备游戏发布" → {{"should_update": true, "update_type": "current_activity", "new_value": "正在准备游戏发布"}}
-                
-                只输出JSON。"""
-
-        try:
-            resp = await doubao_client.generate(prompt, max_tokens=150)
-            resp = resp.strip()
-            if resp.startswith("```"):
-                resp = "\n".join(resp.split("\n")[1:-1])
-            return json.loads(resp)
-        except:
-            return {"should_update": False}
-
 
     async def _execute_dialogue_task(self, agent_id: str, task: Dict) -> Dict:
         """

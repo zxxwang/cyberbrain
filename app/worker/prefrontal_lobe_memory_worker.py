@@ -6,7 +6,9 @@ Prefrontal Lobe Memory Worker: 每日凌晨的工作记忆整理
 2. 从 stm 原文里整理出经历写入 Episodic（episode_consolidation_service），失败则本次不整理、原文保留
 3. 使用 LLM 压缩成简洁的当日摘要，放入 compress 队列
 4. 清理：stm 只删除参与整理的那部分，整理期间新到的消息保留
-5. 全部 agent 整理完后触发反思（reflection_worker）：反思要看到今天刚整理、刚重激活的经历
+5. 结合当天完整的对话复核处境（_review_situation）：删掉已结束的、重复的、混进来的待办和已经过去的事，
+   补上新出现的持续状况；没有结束证据的保留
+6. 全部 agent 整理完后触发反思（reflection_worker）：反思要看到今天刚整理、刚重激活的经历
 
 注意：
 - 经历在这里（以及滚动压缩前）提取，而不是 Memory Gate 逐句实时写：整理时看得到上下文和"我"说的话
@@ -17,6 +19,7 @@ Prefrontal Lobe Memory Worker: 每日凌晨的工作记忆整理
 import asyncio
 import json
 import logging
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
 
@@ -50,38 +53,6 @@ DAILY_SUMMARY_PROMPT = """你是一个记忆整理助手。
 
 输出格式：直接输出摘要文本，不要加任何标记或解释。
 """
-
-# Situation更新 Prompt
-SITUATION_UPDATE_PROMPT = """你是一个状态追踪助手。
-
-任务：根据过去24小时的对话，更新"我"当前的状态。
-
-当前状态：
-{current_situation}
-
-昨日对话：
-{records}
-
-要求：
-1. 判断"我"当前的主要活动（current_activity）是否有变化
-2. 更新时间敏感事件（time_sensitive_events）：
-   - 保留未完成且未过期的事件
-   - 添加昨日提到的新事件（必须有明确日期）
-   - 格式：{{"description": "事件描述", "deadline": "YYYY-MM-DD", "status": "pending"}}
-3. 更新持续状态（ongoing_states）：
-   - 例如"最近失恋了"、"正在学习新技术"
-   - 没有日期的状态
-4. 更新关注焦点（attention_focus）：当前主要关注什么
-
-输出格式：只输出JSON，不要markdown代码块
-{{
-  "current_activity": "...",
-  "time_sensitive_events": [...],
-  "ongoing_states": [...],
-  "attention_focus": [...]
-}}
-"""
-
 
 class PrefrontalLobeMemoryWorker:
     def __init__(self):
@@ -176,12 +147,131 @@ class PrefrontalLobeMemoryWorker:
             # 记录今天遇到的新陌生人到人际关系表
             await self._record_new_strangers(agent_id, records, date)
 
+            # 结合今天完整的对话复核一遍处境（失败不影响整理结果，处境保持原样）
+            situation_changes = await self._review_situation(agent_id, stm_records, daily_summary)
+
             logger.info(f"Daily consolidation for {agent_id}: {len(records)} records -> daily summary "
-                        f"({len(daily_summary)} chars), episodes {episode_result}")
-            return {"records": len(records), **episode_result}
+                        f"({len(daily_summary)} chars), episodes {episode_result}, situation changes {situation_changes}")
+            return {"records": len(records), **episode_result, "situation_changes": situation_changes}
 
         finally:
             await redis_client.release_lock(lock)
+
+    async def _review_situation(self, agent_id: str, stm_records: List[Dict[str, Any]], daily_summary: str) -> int:
+        """
+        每日复核处境（SITUATION_REVIEW_PROMPT）。对话中的处境更新只看一句话，久了会留下已经结束的状况、
+        重复的条目、混进来的待办和已经过去的事；这里结合当天完整的对话逐条复核。
+
+        - 过期事件先用代码删掉（日期是确定的，不需要模型判断）
+        - 每一条都编号，要求模型逐条给出 keep / delete / rewrite，再由代码组装：
+          keep 的原样保留（不会被顺手改写），没有被逐条判断过的东西也不会悄悄留下。
+          以前让模型直接输出整份新处境，它常把条目原样抄过去而不真正判断，删除是否生效每次不一样
+        - 当天没有对话原文时不调用模型：没有新证据，只靠"很久没提"不能判断一件事结束了
+        - 输出不合法时重试一次，仍失败则处境保持原样
+
+        Returns:
+            改动条数（delete + rewrite + add + 正在做的事的变化；没有调用或失败时为 0）
+        """
+        from app.config.prompts import SITUATION_REVIEW_PROMPT
+        from app.service.subjectivity_service import subjectivity_service
+
+        try:
+            await subjectivity_service.clean_expired_events(agent_id)
+            raw = [r for r in stm_records if r.get("type") == "raw"]
+            context = await subjectivity_service.get_context(agent_id)
+            if not raw or not context or not context.situation:
+                return 0
+            sit = context.situation
+
+            # 逐条编号：E 事件 / S 状况 / F 关注
+            items: Dict[str, Dict[str, Any]] = {}
+            for n, e in enumerate(sit.get("time_sensitive_events") or [], 1):
+                items[f"E{n}"] = {"type": "E", "text": e.get("description") or e.get("event") or "",
+                                  "deadline": e.get("deadline")}
+            for n, t in enumerate(sit.get("ongoing_states") or [], 1):
+                items[f"S{n}"] = {"type": "S", "text": t}
+            for n, t in enumerate(sit.get("attention_focus") or [], 1):
+                items[f"F{n}"] = {"type": "F", "text": t}
+            if not items:
+                return 0
+            listing = "\n".join(f"[{k}] {v['text']}" + (f"（{v['deadline']}）" if v.get("deadline") else "")
+                                 for k, v in items.items())
+
+            tasks = [t.get("content", "") for t in context.pending_tasks][:20]
+            now = datetime.now()
+            prompt = SITUATION_REVIEW_PROMPT.format(
+                today=now.strftime("%Y-%m-%d"),
+                weekday="星期" + "一二三四五六日"[now.weekday()],
+                current_activity=sit.get("current_activity") or "（无）",
+                items=listing,
+                pending_tasks="\n".join(f"- {t}" for t in tasks) or "（无）",
+                daily_summary=daily_summary,
+                records=format_records(raw)[-6000:],  # 只留最近的部分，控制长度
+            )
+            # 模型偶尔输出不合法的 JSON（多为文字里夹了英文双引号）：重试一次，仍失败则处境保持原样
+            data = None
+            for attempt in range(2):
+                text = (await doubao_client.generate(prompt, max_tokens=1500) or "").strip()
+                if "{" in text and "}" in text:
+                    text = text[text.index("{"): text.rindex("}") + 1]
+                try:
+                    data = json.loads(text)
+                    break
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Situation review for {agent_id}: invalid JSON (attempt {attempt + 1}): {e}")
+            if data is None:
+                return 0
+
+            decisions = {d.get("id"): d for d in data.get("decisions") or [] if isinstance(d, dict)}
+            kept: Dict[str, List[Dict[str, Any]]] = {"E": [], "S": [], "F": []}
+            changes: List[str] = []
+            for key, item in items.items():
+                d = decisions.get(key) or {}
+                kind = (d.get("kind") or "situation").lower()
+                action = (d.get("action") or "keep").lower()   # 漏判的条目按 keep 处理，不丢数据
+                # 先看这一条本身是什么：待办、已经发生完的事不属于处境，直接删（和今天有没有提到无关）。
+                # 以前和"没有结束证据就保留"放在同一层判断，模型会以"今天没提到"为由把它们留下
+                if kind in ("todo", "past"):
+                    changes.append(f"删除 [{key}] {item['text']}（不是处境：{kind}，{d.get('reason', '')}）")
+                    continue
+                if action == "delete":
+                    changes.append(f"删除 [{key}] {item['text']}（{d.get('reason', '')}）")
+                    continue
+                if action == "rewrite" and (d.get("text") or "").strip():
+                    item = {**item, "text": d["text"].strip(),
+                            "deadline": (d.get("deadline") or item.get("deadline")) if item["type"] == "E" else None}
+                    changes.append(f"改写 [{key}] → {item['text']}（{d.get('reason', '')}）")
+                kept[item["type"]].append(item)
+            for a in data.get("add") or []:
+                typ, text = (a.get("type") or "").upper(), (a.get("text") or "").strip()
+                if typ not in kept or not text or (typ == "E" and not a.get("deadline")):
+                    continue
+                if (a.get("kind") or "situation").lower() != "situation":
+                    continue
+                # 已有条目改写过一次、又在新增里写了一遍：和已保留的某条高度相似就不再加
+                if any(SequenceMatcher(None, text, i["text"]).ratio() >= 0.6 for i in kept[typ]):
+                    continue
+                kept[typ].append({"type": typ, "text": text, "deadline": a.get("deadline") if typ == "E" else None})
+                changes.append(f"新增 [{typ}] {text}（{a.get('reason', '')}）")
+            new_activity = (data.get("current_activity") or "").strip()
+            if new_activity and new_activity != (sit.get("current_activity") or ""):
+                changes.append(f"正在做的事 → {new_activity}")
+            if not changes:
+                return 0
+
+            await subjectivity_service.replace_situation(agent_id, {
+                **sit,
+                "current_activity": new_activity or sit.get("current_activity", ""),
+                "time_sensitive_events": [{"description": i["text"], "deadline": i["deadline"]} for i in kept["E"]],
+                # 状况、关注每类最多 3 条：保留和改写过的在前、新增的在后，超出时丢掉新增的
+                "ongoing_states": [i["text"] for i in kept["S"]][:3],
+                "attention_focus": [i["text"] for i in kept["F"]][:3],
+            })
+            logger.info(f"Situation review for {agent_id}: {changes}")
+            return len(changes)
+        except Exception as e:
+            logger.error(f"Situation review failed for {agent_id}, keep as is: {e}", exc_info=True)
+            return 0
 
     async def _compress_daily_summary(self, date: str, records: List[Dict[str, Any]]) -> str:
         """

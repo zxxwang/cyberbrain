@@ -179,7 +179,11 @@ Query vector cache: `embedding_client.embed_query()` has a 512-entry LRU cache (
 
 Implementation: `app/service/system1_tev1.py`. It calls the **System One decision API** of Volcano Engine Ark (`doubao_client.decide()`, with the request header `ark-beta-systemone-api: true`, default model `DOUBAO_MODEL_LITE`). It does not generate text. Instead it makes a choice or gives a score for a set of questions, and returns probabilities.
 
-**Input context** (concatenated in this order): who the other person is → subject context (overall state + situation) → System1 persona fragment → Brief memories → the material I have on this topic (titles of knowledge that survived rerank, or "no material directly on this topic") → the recent conversation (the last `BRAIN_SYSTEM1_RECENT_TURNS` raw entries of working memory, default 4, excluding the current sentence and compressed summaries) → the external signal (the speaker is labeled again right before the signal, because a small model gives more weight to content right next to the signal).
+**Input context** (concatenated in this order): who the other person is → subject context (overall state + situation) → System1 persona fragment → Brief memories → the material I have on this topic (titles of knowledge that survived rerank, or "no material directly on this topic") → the recent conversation (the last `BRAIN_SYSTEM1_RECENT_TURNS` raw entries of working memory, default 4, excluding the current sentence and compressed summaries) → my state right now (`describe_state()` turns the overall state into one sentence, e.g. "not in a great mood, under a lot of stress, a bit tired") → the external signal (the speaker is labeled again right before the signal, because a small model gives more weight to content right next to the signal).
+
+**The overall state is given in words, right before the signal:** it used to appear only as three numbers at the top of the context, and removing it barely changed System1's judgments (Lin Shiyu had 7/6/6 negative emotions out of 12 under "very bad / baseline / very good"). In words next to the signal, plus a general rule in the emotion instructions (when in a bad mood, stressed or tired, the same sentence is more likely to irritate, sting or drain; in a good state one is more tolerant), the counts became 12/3/1 and engagement 0.47/0.74/0.83. There is no runaway loop: the return to baseline is driven by time (see [overall state](#feeling-overall-state)), and in-conversation deltas have diminishing returns.
+
+**Concern within a relationship is background:** the emotion instructions state that the emotion is a reaction to this sentence; long-standing worry about the other person from the relationship description is aroused only when this sentence touches on it. The relationship description used to say "she's about to break", so even "good night" from her was judged anxious (0.99); measured, sentences unrelated to the worry went from 4/15 anxious to 0/15, while related ones stayed at 7/9. The relationship description should hold only the stable relationship itself: changing circumstances such as "she has been getting worse lately" belong in the situation (which updates with conversations), and past events such as "borrowed 100k last month" belong in Episodic.
 
 System1 gets the recent conversation because the meaning of elliptical replies like "需要" ("yes, I need it"), "好的" ("okay") or "不用了" ("no need") lies entirely in the previous sentence. Given only two isolated characters, System1 can only guess.
 
@@ -203,6 +207,7 @@ System1 gets the recent conversation because the meaning of elliptical replies l
 
 - Score questions (continuous 0–4) are mapped linearly to 0–1: `intensity`, `engagement`, `conflict`
 - `requires_knowledge`: true if the probability > 0.5
+- `emotion`: the most probable option becomes the main emotion; the top 3 probabilities are also kept as `emotion_probs` in the API response and the trace, for observation only, not used by routing or state updates. They express how certain the choice is, not a mix of co-existing emotions; measured, the top one is usually ≥ 0.9 (e.g. "I passed the grad-school exam!": 喜悦 0.81 / 惊喜 0.14)
 - `quick_action`: **the probability of 得想一想 is taken out separately** as `think_prob`; among the remaining options, the one with the highest probability becomes the intuitive action, and its probability is recorded as `action_confidence`
 - `needs_memory`, `needs_reasoning`: the raw probabilities are kept and passed to routing, which applies thresholds
 
@@ -220,6 +225,7 @@ On failure, a neutral result is returned: 平静, intensity 0, `think_prob = 1.0
 | 2 | `think_prob` ≥ `BRAIN_ROUTE_THINK_THRESHOLD` (0.5) | deliberate | `think_prob` |
 | 3 | The speaker is in the relationship table, the intuitive action is 直接拒绝 / 顶回去, and `conflict` < `BRAIN_ROUTE_HOSTILE_MAX_CONFLICT` (0.4) | deliberate | `hostile_to_known` |
 | 4 | `action_confidence` < `BRAIN_ROUTE_MIN_ACTION_CONFIDENCE` (0.55) | deliberate | `low_action_confidence` |
+| 4.5 | The other person is talking about the past (intent 提起往事, situation 提及共同经历, or `needs_memory` at threshold — any one), and the top Episodic score < `BRAIN_EPISODIC_CUE_MIN_SCORE` | deliberate | `recall_uncertain` |
 | 5 | Knowledge is used | memory | `knowledge` |
 | 6 | `needs_memory` ≥ `BRAIN_ROUTE_MEMORY_THRESHOLD` (0.6) | memory | `needs_memory` |
 | 7 | The highest rerank score among the Episodic memories retrieved in parallel ≥ `BRAIN_EPISODIC_CUE_MIN_SCORE` (0.75) | memory | `episodic_cue` |
@@ -227,6 +233,7 @@ On failure, a neutral result is returned: 平静, intensity 0, `think_prob = 1.0
 
 - Rule 3: if System1 picks a refusal toward someone "I" know, but the topic has almost no conflict, System1 has most likely misunderstood. System2 reviews it. A refusal toward a stranger, or a refusal when conflict really is high, is still carried out as intuited
 - Rule 4: when the intuitive action's probability is spread out (several options are about equal), the choice is close to random and should not turn directly into a reply
+- Rule 4.5 (cannot recall): asked about a past event they can't recall, people pause and think. Writing "I can't recall" into the intuitive plan as a fact proved ineffective: System3 (the character model) still invented answers ("the pothos is doing fine", "the pen was a Lamy"). System2 writes how to respond (say so plainly, stay vague, ask back — per persona) into its decision, and System3 only voices it. System1's intent and situation definitions now explicitly include *asking about* the past (they used to say only "bringing up", so "what brand was that pen again?" was classed as an ordinary question)
 - A knowledge hit does not force System2, but the route is at least memory, so related experiences are recalled too.
 - Either rule 6 or rule 7 is enough to bring memories in. `needs_memory` is a single yes/no judgment by a small model and is quite unstable: for the same sentence 我之前跟你说要去哪儿开民宿来着？ ("where did I say I'd open a guesthouse?") with identical input, two runs gave 0.47 and 0.05, and rewording the question only changes the kind of instability. Past events are usually brought back by what the other person says: Episodic retrieval already runs in parallel with System1, and if it finds a memory highly relevant to the sentence, it should be recalled, just as knowledge is used whenever something survives rerank. Measured (rerank scores): sentences that need recalling the past scored 0.81–0.98; those that don't scored 0–0.66, the highest being the reading experience evoked by 你觉得《百年孤独》好看吗 ("do you like One Hundred Years of Solitude?", 0.66), which is the kind of personal experience a topic should bring back anyway
 - Episodic retrieval is awaited before routing, since rule 7 depends on it. It runs in parallel with System1 and was measured to always finish first (150–230 ms vs about 370–720 ms for System1), so it usually costs nothing extra; the wait is recorded as `episodic_wait`. On the fast route the retrieved memories are not put into the plan. The trace's `recall.episodic_cue` records the highest score of the turn
@@ -239,7 +246,11 @@ When System1 thinks knowledge is needed but nothing survives rerank, **and the o
 
 **How to behave when not knowing is decided by the persona**: saying "I don't know", answering from vague impressions, changing the subject, or turning the question back are all expressions of metacognition and differ from person to person. System1 runs after the knowledge prefetch, and its input includes "the material I have on this topic" (titles of the matched knowledge, or "no material directly on this topic"). Based on the persona, it picks an intuitive action (such as 简单回答 "simple answer", 凭印象说 "answer from impression", 岔开话题 "change the subject", 反问对方 "ask back"), and System3 carries it out. Metacognition belongs in the persona (`persona_system1` decides the first reaction, `persona_system2` decides judgment when deliberating), not in the speaking manner.
 
-**Intuitive plan (fast / memory routes):** generated by `_quick_plan()`. It contains the other person's intent, "my first reaction" and its explanation. On the memory route it adds up to 3 recalled past events (with the note "details not here are things I don't remember clearly") and the matched knowledge. When the other person is asking a question, it requires answering directly first and then asking back. It always includes this reminder: things not actually done (who was contacted, what was sent, what was arranged) must not be described as done; "I" can only say "I" plan to do them, or ask whether the other person wants them done. The fast / memory routes have no System2 fact check, so this constraint can only live in the plan.
+**What each of the three persona parts holds:** bottom lines that every route must keep (identity, relationship boundaries, honesty) go in `persona_system1`: System1 and System3 see it every turn, including on the fast / memory routes. `persona_system2` is used only on the deliberate route and should hold how to judge when thinking things through (how to weigh things, how to advise, when to warn about risk). A bottom line written only in system2 is invisible to the fast route: measured, boundaries such as privacy, authorization and risk warnings were also in system1, and both routes behaved consistently. Note, however, that putting "say you don't know when you don't" into system1 does not stop the fast route from inventing information it cannot have: asked about the weather, the bitcoin price, the number of emails, parking spaces or a past blood-pressure reading, Jarvis invented specific numbers in 17 of 18 replies (the weather was answered honestly only when the persona named "real-time weather" as an example, which is overfitting to the example). Such "current facts I cannot know" need a structural fix and are not yet solved.
+
+**Intuitive plan (fast / memory routes):** generated by `_quick_plan()`. It contains the other person's intent, "my first reaction" and its explanation. On the memory route it adds up to 3 recalled past events and the matched knowledge; the past events are rendered by `_format_recall()` (shared with System2) together with the boundary of memory: "this is all I remember; anything not written here I don't know". When the other person is talking about the past, it also states that the retrieved memories are only candidates and may not include the event they mean, and if nothing was recalled it says "I can't recall anything specific about this". System2 always gets the memories framed as candidates (System1 often fails to recognize talk about the past, while this note holds for any sentence). It only states facts; how to respond when not remembering is left to the persona. When the other person is asking a question, it requires answering directly first and then asking back. It always includes this reminder: things not actually done (who was contacted, what was sent, what was arranged) must not be described as done; "I" can only say "I" plan to do them, or ask whether the other person wants them done.
+
+**This-turn timing fact (`THIS_TURN_FACT`):** within a react turn the reply is generated and returned first; what the other person asked for (creating a to-do, a reminder, contacting someone, looking something up) is judged and executed in the background after the reply, and may not happen at all (the funnel decides it is not needed, the lock is busy, a model call fails). So the intuitive plan, the System2 input and the end of the System2 decision plan all state one fact: "this turn I have done nothing except speak; what they just asked me to do has not been done yet and will be done later". It states only the timing and prescribes no wording, so replies naturally become commitments ("Certainly, I'll take care of it / I'll remind you then") rather than "Reminder set". Previously there was only the rule "don't claim something done unless the plan says it is done", and the model treated "set a reminder" or "note it down" as done the moment it agreed (Jarvis measured 10/16 in the completed form, 2/33 after the change). System2's fact boundary also gained a line: to-dos and events in the situation only show that the thing exists, not that it has been done. The fast / memory routes have no System2 fact check, so this constraint can only live in the plan.
 
 ---
 
@@ -418,7 +429,13 @@ If evaluation fails, it is treated as importance = 2, SEMANTIC.
 
 When read, it goes to System1/2/3 together with the speaker description: `我对{人名}的了解（对方自己说过的，不是我自己的事）：- 住址：上海……`, kept clearly apart from "my beliefs".
 
-**Updating the situation after writing:** another System One request decides whether this information requires updating the situation. If so, `SITUATION_UPDATE_PROMPT` has the LLM output a new, complete situation JSON, which replaces the old one as a whole via `replace_situation()`. Each event in the new situation that is due within 3 days adds +0.1 to stress. If no update is needed, an overall state adjustment is still called once (with zero delta, which amounts to recomputing energy from the current stress).
+**Updating the situation:** another System One request decides whether my situation changed (a new event with a definite date; an existing one rescheduled, resolved or cancelled; a lasting circumstance of mine or of someone I care about changed; what is on my mind changed). Being asked to do something or agreeing to do it (a to-do), or just hearing about something that is already over (an experience), counts as no change. If it changed, `SITUATION_UPDATE_PROMPT` has the LLM output a new, complete situation JSON, which replaces the old one via `replace_situation()`. The prompt includes:
+- today's date and weekday, so relative times (tomorrow, next Wednesday, end of month) convert to exact dates; without it, "next Wednesday" used to be written as tomorrow
+- the speaker and the few raw lines before this sentence, since elliptical replies ("approved, my last day is the end of the month") need context
+- the boundary with to-dos and experiences: actions I am going to take are to-dos, things already over are experiences, and neither goes into the situation
+- the same matter rescheduled or progressing rewrites its entry instead of adding one; resolved, cancelled or past items are deleted rather than marked "done" (rendering ignores status, so a kept entry would read as still pending); at most 3 per category
+
+Each event in the new situation that is due within 3 days adds +0.1 to stress.
 
 ---
 
@@ -457,6 +474,8 @@ Implementation: `subjectivity_service`. All data is stored in one `subject_conte
   "thoughts": [{"time": "...", "thought": "...", "related_to": "...", "target_person": "...", "urgency": 0.5, "expressed": false}],
   "pending_tasks": [{"task_id": "...", "content": "...", "source": "dialogue", "priority": 0.8, "deadline": "...", "related_person": "...", "interaction_type": "dialogue", "created_at": "...", "status": "pending", "vector": [...]}],
   "recent_done": [{"task_id": "...", "content": "...", "vector": [...], "status": "completed", "done_at": "..."}],
+  "baseline": {"mood": 0.35, "stress": 0.45, "energy": 0.55},
+  "state_updated_at": "...",
   "last_update": "..."
 }
 ```
@@ -465,23 +484,32 @@ The example values in this JSON mean: 准备游戏上线 ("preparing the game la
 
 ### Fact: situation
 
-- Written by: the init / update API, Memory Gate, to-do execution
-- Format in the prompt (`format_for_prompts`): current activity, up to 3 time-sensitive events, up to 3 ongoing states. `attention_focus` does not go into the react prompts
-- Given to System1 and System2, not System3
+- Written by: the init / update API and Memory Gate. To-do execution does not write it: an ordinary to-do's "result" is a sentence the LLM makes up, which used to append invented, already-finished things such as "had a deep talk with so-and-so" to the ongoing states
+- Format in the prompt: rendered by a single `render_situation()`, shared by System1/2 (`format_for_prompts`) and thought generation (`format_situation_for_prompt`), so both see the same situation. It contains the current activity; time-sensitive events (expired, undated or malformed ones are skipped; the nearest 3 by deadline are shown, each marked "today / tomorrow / N days left", because with a bare date the model cannot tell past from future); up to 3 ongoing states; and up to 3 current focuses (`attention_focus`)
+- Given to System1, System2, and the intuitive plan on the fast / memory routes ("my recent situation (answer from this when asked; no need to bring up what isn't asked)"). The situation is by design a few things constantly on one's mind, at most 3 per category, so no relevance selection is needed: the fast / memory routes have no System2, and without the situation the speaking System3 could only make up answers to "when does the certificate expire" or "which book is the reading club doing". Measured (Jarvis and Lin Shiyu, 12 situation questions, 20 small-talk lines): without the situation 2/12 were correct; with the whole situation 12/12, and small talk did not get the situation forced in (an occasional natural mention, such as reminding about short sleep when told about playing tennis, is expected). Selecting only relevant items by similarity (cosine filter + rerank) was tried and did no better (9/12), so it was removed
 
 ### Feeling: overall state
 
-- Three continuous values: `mood`, `stress`, `energy`
-- Adjustment (`adjust_overall_state`): `mood` is clamped to [-1, 1], `stress` to [0, 1], and **`energy` is recomputed every time as `max(0.1, 1 - stress × 0.7)`**
-- Asynchronous adjustment after a conversation (based on System1's emotion and intensity):
+- Three continuous, mutually independent values: `mood` (−1 worst ~ 1 best, 0 normal), `stress` (0 ~ 1), `energy` (0 ~ 1). They enter prompts with their scales (`format_state_lines()`), otherwise the model cannot tell whether 0.2 is good or bad
+- **Baseline (`baseline`)**: the person's usual state, stored in the subject context. Set by initialization or by `PUT` with overall_state (which also sets the current state to it). Old data without a baseline uses a neutral one (0 / 0.3 / 0.7)
+- **Settling by time (`settle_state()`)**: whenever the subject context is read, the time elapsed since `state_updated_at` is applied; no scheduled task is needed (a value nobody reads need not be current, and when read it is computed correctly):
+  - mood and stress regress exponentially to the baseline: `x += (baseline − x)·(1 − e^(−hours/τ))`, τ = `STATE_REGRESSION_TAU_HOURS` (6 hours: about 63% back after 6 hours, essentially back after a day; nearly unchanged within minutes, so a continuous conversation is not flattened)
+  - energy recovers toward its baseline with τ = `ENERGY_RECOVERY_TAU_HOURS` (4 hours) × (1 + stress), slower under higher stress
+  - after settling, `state_updated_at` is set to now. It is separate from `last_update`, which any save refreshes (e.g. adding a to-do) and would wrongly reset the clock. Settling in steps equals settling at once, so reading without writing, or reading and saving for another reason, never regresses twice
+- **Adjustment (`adjust_overall_state`)**: settle time first, then add the deltas. Deltas have diminishing returns: they are multiplied by the remaining room to the bound as a fraction of the range, so the nearer the bound the harder to push further while pulling back is barely affected; repeated same-direction stimuli saturate instead of hitting the bound in a few turns
+- **Asynchronous adjustment after a conversation** (by System1's emotion and intensity, `EMOTION_STATE_EFFECT`, covering all 16 System1 emotions). Delta = coefficient × intensity:
 
-  | Emotion | mood change | stress change |
-  |---|---|---|
-  | 喜悦, 兴奋, 感激 | +intensity × 0.3 | −intensity × 0.1 |
-  | 焦虑, 愤怒, 沮丧, 恐惧 | −intensity × 0.3 | +intensity × 0.2 |
-  | 平静 | 0 | −intensity × 0.15 |
+  | Group | Emotion (mood coef / stress coef) |
+  |---|---|
+  | Positive · high arousal | 兴奋 0.30/−0.05, 喜悦 0.30/−0.10, 惊喜 0.25/−0.05, 自豪 0.25/−0.10 |
+  | Positive · low arousal | 平静 0.05/−0.15, 满足 0.20/−0.15, 信任 0.10/−0.10, 感激 0.20/−0.10 |
+  | Negative · high arousal | 愤怒 −0.30/0.20, 焦虑 −0.20/0.20, 恐惧 −0.30/0.25, 沮丧 −0.30/0.15 |
+  | Negative · low arousal | 悲伤 −0.30/0.05, 无聊 −0.10/0, 厌恶 −0.20/0.10, 困惑 −0.05/0.05 |
 
-  The change is written when it exceeds 0.01, and an `emotion` life event is recorded (linked to the conversation turn via `trace_id`)
+  Previously only 9 were handled (including 高兴 and 放松, which System1 never outputs); 信任, 悲伤, 无聊 and others changed nothing: Jarvis, mostly judged 信任, never changed, while Lin Shiyu, mostly judged 焦虑, never recovered and stuck at mood −1, stress 1
+- **Energy cost**: each conversation turn costs `ENERGY_COST_PER_TURN` (0.02) × (1 + arousal × intensity), at most double for high-arousal emotions. Energy is no longer derived from stress (it used to be `1 − stress × 0.7`, which could not express "tired but not stressed")
+- An `emotion` life event is recorded when mood or stress changes by more than 0.01 (linked to the turn via `trace_id`); energy-only changes are not recorded. On situation updates, each event due within 3 days adds +0.1 stress (also with diminishing returns)
+
 - Given to System1, System2 and System3
 
 ### Fabrication: thoughts
@@ -638,6 +666,13 @@ For each agent (sharing the lock with rolling compression; the lock duration is 
 3. The LLM generates a first-person daily summary of at most 150 characters
 4. This one daily summary block (with all of the day's speakers) **replaces** the whole compressed queue, and the raw entries before the cursor are deleted (messages that arrive during consolidation are kept)
 5. New speakers from the previous day are added to the relationship table
+6. **Review the situation** (`_review_situation`, `SITUATION_REVIEW_PROMPT`): in-conversation situation updates see one sentence at a time and over time leave behind finished circumstances, duplicates, to-dos that slipped in, and things already over. Expired events are first removed in code; then the current situation (numbered item by item), the to-do list, the daily summary and the day's raw conversation go to the LLM, which **judges each item in two steps**:
+   - step 1 `kind`: what the item itself is: situation (a lasting circumstance, a dated event, something on my mind), to-do (an action I am to take), or past (something already over). This looks only at the item, regardless of whether it came up today; to-dos and past items are deleted by code
+   - step 2 `action`, for situation items only: keep / delete (today's conversation shows it ended, was resolved or cancelled, or it duplicates another) / rewrite (new progress). **Items with no evidence of having ended are kept**: not being mentioned for a long time does not mean something is over. Relative-time phrases ("this week", "the last two weeks") are changed only when today's conversation shows they no longer hold, and are never converted to specific dates (the original writing date is unknown)
+
+   Additions accept only situation items, and those highly similar to a kept item are dropped. Rewrites and additions contain only information that appeared in today's conversation. Code assembles the result from the decisions: kept items are copied verbatim, undecided items count as keep; states and focuses are capped at 3 each, dropping additions first. The model is not called if there was no raw conversation that day; invalid output is retried once, and if it still fails the situation stays unchanged.
+
+   Why two steps: asking the model to output a whole new situation made deletions hit or miss from run to run; with per-item decisions in a single layer, the model often kept to-dos and past items "because they weren't mentioned today", since "keep without evidence of ending" and "delete what isn't a situation" competed at the same level. Separated, 5 out of 5 runs matched expectations.
 
 If episode consolidation or the summary fails, nothing is cleaned up, and the data waits for the next run. The daily summary stays only in working memory and is not written to long-term memory. After every agent is processed, [reflection](#reflection-reflection-worker) is triggered.
 
@@ -675,7 +710,7 @@ Query: `GET /admin/timeline/{agent_id}?event_types=react_input,react_output&page
 | `POST /admin/initialize_agent` | Writes persona, Brief/Episodic/Knowledge, relationships, situation, overall state, thoughts and to-dos in one go. A Redis lock prevents concurrent duplicate initialization. Returns 409 if the agent already has any data in Redis or Qdrant. **The persona is written only when both system1 and system2 are provided**. `capabilities` sets the capabilities (currently only `web_search`); omitted means none |
 | `GET /admin/agents` | The union of agents from persona (`persona:*:system1`) and subject_context |
 | `GET /admin/agent/{agent_id}` | Returns full information in the same structure as the init API |
-| `PUT /admin/agent/{agent_id}` | Overwrite update; only the fields passed are updated. situation / overall_state / thoughts / pending_tasks are replaced as a whole (entries in pending_tasks whose status is not pending are ignored); relationships are cleared and then written (passing `[]` clears them); capabilities are replaced as a whole (passing `[]` turns all off). Returns 404 if the agent does not exist |
+| `PUT /admin/agent/{agent_id}` | Overwrite update; only the fields passed are updated. situation / overall_state / thoughts / pending_tasks are replaced as a whole (entries in pending_tasks whose status is not pending are ignored); relationships are cleared and then written (passing `[]` clears them; people still in the list keep the profile gathered from conversations); capabilities are replaced as a whole (passing `[]` turns all off). Returns 404 if the agent does not exist |
 | `POST /admin/agent/{agent_id}/memories` | Appends Brief / Episodic / Knowledge; each entry is written as a new record. Returns 404 if the agent does not exist |
 | `DELETE /admin/agent/{agent_id}/pfc` | Deletes `stm` and `stm:compress` |
 | `GET /brain/fetch_talk` | Params `agent_id`, `human`: takes what the agent proactively wants to say to this person; taking deletes them. See [Proactive Outreach](#proactive-outreach) |
