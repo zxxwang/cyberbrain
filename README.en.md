@@ -90,7 +90,7 @@ The full thinking process of every turn is recorded: instinct scores, which cogn
 
 ## Showcase
 
-**Chat**: pick a speaker and talk to the agent. Here, Jarvis, a private AI butler, receives a reminder request from its owner, Stark:
+**Chat**: pick a speaker and talk to the agent:
 
 <img src="images/chat.png" alt="Chatting with an agent" width="100%">
 

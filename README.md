@@ -90,7 +90,7 @@ flowchart LR
 
 ## 效果展示
 
-**对话**：选择说话人，直接和 Agent 对话。下面是私人 AI 管家 Jarvis 接到主人 Stark 的提醒请求：
+**对话**：选择说话人，直接和 Agent 对话：
 
 <img src="images/chat.png" alt="与 Agent 对话" width="100%">
 
